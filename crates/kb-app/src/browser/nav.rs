@@ -14,7 +14,7 @@ impl Browser {
         self.history.push(target.clone());
         self.scrolls.push(0.0);
         self.idx = self.history.len() - 1;
-        if self.page.is_some() && same_document(&self.url, &target) && self.url != target {
+        if self.has_page() && same_document(&self.url, &target) && self.url != target {
             self.show_fragment(&target);
             return;
         }
@@ -56,13 +56,14 @@ impl Browser {
         let saved = self.scrolls.get(self.idx).copied().unwrap_or(0.0);
         // An entry that pushState created on the page still loaded: no reload, just popstate with its state.
         if let Some((doc, state)) = self.pushed_states.get(&url).cloned() {
-            if self.page.is_some() && doc == super::loading::document_of(&self.page_url) {
+            if self.has_page() && doc == super::loading::document_of(&self.page_url) {
                 self.url = url.clone();
-                if let Some(page) = self.page.as_mut() {
-                    page.set_location(&url);
-                    page.pop_state(&state);
-                    page.scroll_to(saved);
-                }
+                let location = url.clone();
+                self.page_on(move |p| {
+                    p.set_location(&location);
+                    p.pop_state(&state);
+                    p.scroll_to(saved);
+                });
                 self.mark_page_dirty();
                 self.keyboard = false;
                 self.sheet = None;
@@ -70,17 +71,13 @@ impl Browser {
                 return;
             }
         }
-        if self.page.is_some() && same_document(&self.url, &url) && self.url != url {
+        if self.has_page() && same_document(&self.url, &url) && self.url != url {
             self.show_fragment(&url);
-            if let Some(page) = self.page.as_mut() {
-                page.scroll_to(saved);
-            }
+            self.page_on(move |p| p.scroll_to(saved));
             return;
         }
         if self.restore_previous(&url) {
-            if let Some(page) = self.page.as_mut() {
-                page.scroll_to(saved);
-            }
+            self.page_on(move |p| p.scroll_to(saved));
             return;
         }
         self.navigating_history = true;
@@ -88,20 +85,22 @@ impl Browser {
         self.navigating_history = false;
         match outcome {
             Ok(()) => {
-                if let Some(page) = self.page.as_mut() {
-                    page.scroll_to(saved);
-                }
+                self.page_on(move |p| p.scroll_to(saved));
             }
             Err(Cancelled) => self.idx = prev,
         }
     }
 
     pub(super) fn show_fragment(&mut self, url: &str) {
-        if let Some(page) = self.page.as_mut() {
-            page.set_location(url);
-            let parsed = url::Url::parse(url).ok();
-            page.scroll_to_fragment(parsed.as_ref().and_then(|u| u.fragment()).unwrap_or(""));
-        }
+        let location = url.to_string();
+        let fragment = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.fragment().map(str::to_owned))
+            .unwrap_or_default();
+        self.page_on(move |p| {
+            p.set_location(&location);
+            p.scroll_to_fragment(&fragment);
+        });
         self.url = url.to_string();
         self.page_url = url.to_string();
         self.keyboard = false;
@@ -133,23 +132,34 @@ impl Browser {
         }
     }
 
-    /// Move the page on screen into the one-page cache.
     pub(super) fn stash_current(&mut self, next_url: &str) {
-        if let Some(page) = self.page.take() {
-            if !self.page_url.is_empty() && self.page_url != next_url {
+        if self.has_page() {
+            let keep = !self.page_url.is_empty() && self.page_url != next_url;
+            if keep {
                 self.previous = Some(PreviousPage {
                     url: self.page_url.clone(),
-                    page,
                     source: std::mem::take(&mut self.source),
                     reader_source: self.reader_source.take(),
                     is_web: self.page_is_web,
                 });
             }
+            // The page worker moves the document the same way: kept for Back, or dropped.
+            self.host.ask(move |slots| {
+                let page = slots.page.take();
+                if keep {
+                    slots.previous = page;
+                }
+            });
         }
         self.page_url = next_url.to_string();
     }
 
-    /// Restore the cached previous page, if it is the one we want. Returns true when used.
+    /// Drop the page kept for Back (its document and its address).
+    pub(super) fn forget_previous(&mut self) {
+        self.previous = None;
+        self.host.ask(|slots| slots.previous = None);
+    }
+
     pub(super) fn restore_previous(&mut self, url: &str) -> bool {
         let Some(previous) = &self.previous else {
             return false;
@@ -160,11 +170,29 @@ impl Browser {
         let Some(previous) = self.previous.take() else {
             return false;
         };
-        self.stash_current(url);
-        self.page = Some(previous.page);
-        if let Some(page) = self.page.as_mut() {
-            page.set_location(url);
+        // The page on screen goes into the cache (as `stash_current` does), and the kept page comes back.
+        let keep = self.has_page() && !self.page_url.is_empty() && self.page_url != url;
+        if keep {
+            self.previous = Some(PreviousPage {
+                url: self.page_url.clone(),
+                source: std::mem::take(&mut self.source),
+                reader_source: self.reader_source.take(),
+                is_web: self.page_is_web,
+            });
         }
+        let location = url.to_string();
+        self.host.ask(move |slots| {
+            let current = slots.page.take();
+            let kept = slots.previous.take();
+            if keep {
+                slots.previous = current;
+            }
+            slots.page = kept;
+            if let Some(page) = slots.page.as_mut() {
+                page.set_location(&location);
+            }
+        });
+        self.page_url = url.to_string();
         self.source = previous.source;
         self.reader_source = previous.reader_source;
         self.page_is_web = previous.is_web;
@@ -180,16 +208,15 @@ impl Browser {
     }
 
     pub(super) fn remember_scroll(&mut self) {
-        let pos = self.page.as_ref().map_or(0.0, |p| p.scroll_y());
+        let pos = self.page_on(|p| p.scroll_y()).unwrap_or(0.0);
         if let Some(slot) = self.scrolls.get_mut(self.idx) {
             *slot = pos;
         }
     }
 
-    /// Rebuild the page on screen from its source with the current settings, keeping the reading position.
     pub(super) fn reflow(&mut self) {
         // A cached layout belongs to the previous display/image settings.
-        self.previous = None;
+        self.forget_previous();
         let url = self.url.clone();
         if url.is_empty()
             || url.starts_with("kbp://")
@@ -203,22 +230,18 @@ impl Browser {
             self.touch(0, self.height, Wave::Text);
             return;
         }
-        let scroll = self.page.as_ref().map_or(0.0, |p| p.scroll_y());
+        let scroll = self.page_on(|p| p.scroll_y()).unwrap_or(0.0);
         let source = self.source.clone();
         let reader_source = self.reader_source.clone();
         let rendered = reader_source.as_deref().unwrap_or(&source);
         let base = self
-            .page
-            .as_ref()
-            .map_or(url.as_str(), |p| p.base_url())
-            .to_string();
+            .page_on(|p| p.base_url().to_string())
+            .unwrap_or_else(|| url.clone());
         self.build_page(rendered, &base, self.page_is_web);
         self.source = source;
         self.reader = reader_source.is_some();
         self.reader_source = reader_source;
-        if let Some(page) = self.page.as_mut() {
-            page.scroll_to(scroll);
-        }
+        self.page_on(move |p| p.scroll_to(scroll));
         self.mark_page_dirty();
         self.touch(0, self.height, Wave::Text);
     }

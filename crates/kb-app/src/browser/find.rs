@@ -27,7 +27,8 @@ impl Browser {
         if query == self.find_query && !self.find_matches.is_empty() {
             self.find_index = (self.find_index + 1) % self.find_matches.len();
         } else {
-            self.find_matches = self.page.as_ref().map(|p| p.find_matches(&query)).unwrap_or_default();
+            let needle = query.clone();
+            self.find_matches = self.page_on(move |p| p.find_matches(&needle)).unwrap_or_default();
             self.find_query = query.clone();
             self.find_index = 0;
         }
@@ -37,9 +38,7 @@ impl Browser {
             return;
         }
         let y = self.find_matches[self.find_index];
-        if let Some(page) = self.page.as_mut() {
-            page.scroll_to_match(y);
-        }
+        self.page_on(move |p| p.scroll_to_match(y));
         self.mark_page_dirty();
         self.notify(&format!(
             "Match {} of {}. Find again for the next one.",

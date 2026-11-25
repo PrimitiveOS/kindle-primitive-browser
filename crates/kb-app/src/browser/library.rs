@@ -20,7 +20,7 @@ impl Browser {
         } else {
             "Bookmark removed"
         });
-        self.touch(self.height - BOT_H, self.height, Wave::Fast);
+        self.touch_chrome(self.height - BOT_H, self.height, Wave::Fast);
     }
 
     pub(super) fn record_visit(&mut self, url: &str, title: &str) {
@@ -53,7 +53,7 @@ impl Browser {
         index.push((key, format!("{} {}", self.url, self.title())));
         write_pairs(&data_file("saved.tsv"), &index);
         self.sheet_layer = None;
-        self.touch(self.height - MENU_H, self.height, Wave::Text);
+        self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
         self.notify("Saved for offline");
     }
 }

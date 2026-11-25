@@ -23,6 +23,7 @@ mod actions;
 mod find;
 mod driver;
 mod frame;
+mod host;
 mod input;
 mod internal;
 mod keyboard;
@@ -35,7 +36,8 @@ mod tabs;
 mod types;
 
 use actions::stays_open;
-use types::{Cached, PreviousPage, Sheet, TabSave};
+use host::{Host, Slots};
+use types::{Cached, Flight, PreviousPage, Sheet, TabSave};
 
 pub use frame::encode_png;
 pub(crate) use keyboard::{keyboard_rows, Key, Layer};
@@ -45,16 +47,25 @@ pub struct Browser {
     width: u32,
     height: u32,
     net: Arc<SyncNet>,
-    pump: Option<Pump>,
+    /// The page worker: every page document lives there (see host.rs and docs/06-page-worker.md).
+    host: Host,
 
     history: Vec<String>,
     scrolls: Vec<f64>,
     idx: usize,
-    page: Option<Page>,
+    /// The page picture on screen (the last one painted). It stays on screen while a new one is painted.
     page_gray: Vec<u8>,
     /// Vertical offset the cached page image was painted with.
     page_gray_offset: u32,
+    /// The page changed since its picture was painted.
     page_dirty: bool,
+    /// Bumped by every change to the page. A paint from an older generation is dropped.
+    page_gen: u64,
+    /// A change that touches the page is waiting; it is shown when the page's paint finishes.
+    pending_page: Option<((u32, u32), Wave)>,
+    /// The paint of the page on screen, and the prefetch of the next screen, sent to the worker.
+    paint: Option<Flight>,
+    prefetch: Option<Flight>,
     source: String,
     reader_source: Option<String>,
     page_is_web: bool,
@@ -144,18 +155,22 @@ pub struct Browser {
 impl Browser {
     pub fn new(width: u32, height: u32) -> Browser {
         ensure_defaults();
+        let net = Arc::new(SyncNet::new(SUBRESOURCE_MAX_BYTES));
         Browser {
             width,
             height,
-            net: Arc::new(SyncNet::new(SUBRESOURCE_MAX_BYTES)),
-            pump: None,
+            host: Host::new(net.clone()),
+            net,
             history: Vec::new(),
             scrolls: Vec::new(),
             idx: 0,
-            page: None,
             page_gray: Vec::new(),
             page_gray_offset: u32::MAX,
             page_dirty: true,
+            page_gen: 0,
+            pending_page: None,
+            paint: None,
+            prefetch: None,
             source: String::new(),
             reader_source: None,
             page_is_web: false,
@@ -228,7 +243,35 @@ impl Browser {
 
     /// Install the progress/cancel callback used while pages load.
     pub fn set_pump(&mut self, pump: Pump) {
-        self.pump = Some(pump);
+        self.host.set_pump(pump);
+    }
+
+    /// Install the callback the page worker calls when a job finishes. The device sends its input loop a
+    /// wake-up with it, so the finished page is shown without waiting for an input event.
+    pub fn set_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        self.host.set_waker(waker);
+    }
+
+    /// Whether a page paint is running on the worker.
+    pub fn paint_in_flight(&self) -> bool {
+        self.paint.is_some()
+    }
+
+    /// Whether a page is open (the worker holds it).
+    pub(super) fn has_page(&self) -> bool {
+        self.host.mirror().has_page
+    }
+
+    /// Run `f` on the page on screen, on the worker, and return its result. `None` when no page is open.
+    /// Waits behind a paint that is already running; chrome never calls this.
+    pub(super) fn page_on<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Page) -> R + Send + 'static,
+    ) -> Option<R> {
+        if !self.has_page() {
+            return None;
+        }
+        self.host.ask(move |slots| slots.page.as_mut().map(f)).flatten()
     }
 
     pub fn url(&self) -> &str {
@@ -251,16 +294,16 @@ impl Browser {
         self.exit
     }
 
-    pub fn title(&self) -> &str {
-        self.page.as_ref().map_or("", |p| p.title.as_str())
+    pub fn title(&self) -> String {
+        self.host.mirror().title
     }
 
     pub fn content_height(&self) -> f64 {
-        self.page.as_ref().map_or(0.0, |p| p.content_height())
+        self.host.mirror().content_height
     }
 
     pub fn scroll_pos(&self) -> f64 {
-        self.page.as_ref().map_or(0.0, |p| p.scroll_y())
+        self.host.mirror().scroll_y
     }
 
     /// Images still being fetched in the background.
@@ -270,3 +313,76 @@ impl Browser {
             > s.deferred_done.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
+
+#[cfg(test)]
+mod responsive_tests {
+    use super::*;
+
+    fn browser() -> Browser {
+        let data = std::env::temp_dir().join(format!("kb-app-tests-{}", std::process::id()));
+        std::env::set_var("KB_DATA", &data);
+        std::env::set_var(
+            "KB_FONTS",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/NotoSans-Regular.ttf"),
+        );
+        let mut b = Browser::new(600, 800);
+        b.open("kbp://home");
+        let _ = b.frame();
+        b
+    }
+
+    /// A paint of the page is running on the worker, held by a test delay, so the test can act meanwhile.
+    fn slow_browser() -> Browser {
+        let b = browser();
+        b.host.set_paint_delay(Duration::from_millis(1500));
+        b
+    }
+
+    #[test]
+    fn the_bars_are_shown_while_a_page_is_painted() {
+        let mut b = slow_browser();
+        b.page_step(1.0);
+        assert!(b.try_frame().is_none(), "a page change waits for its paint");
+        assert!(b.paint_in_flight());
+        b.action("menu");
+        let bars = b.try_frame().expect("the menu is shown while the page is painted");
+        assert!(b.paint_in_flight(), "the menu came before the paint finished");
+        assert_eq!(bars.rows.1, b.height, "the update is the menu's rows");
+        let _ = b.frame();
+        assert!(!b.paint_in_flight());
+    }
+
+    #[test]
+    fn the_address_bar_opens_while_a_page_is_painted() {
+        // The bars are on screen; the page is changed (its cache cleared), so it must be painted again.
+        let mut b = browser();
+        b.host.set_paint_delay(Duration::from_millis(1500));
+        b.mark_page_dirty();
+        assert!(b.try_frame().is_none(), "the page change waits for its paint");
+        assert!(b.paint_in_flight());
+        b.tap(300.0, 20.0);
+        let keyboard = b.try_frame().expect("the keyboard opens while the page is painted");
+        assert!(b.paint_in_flight(), "the keyboard came before the paint finished");
+        assert_eq!(keyboard.rows.1, b.height);
+        let _ = b.frame();
+        assert!(!b.paint_in_flight());
+    }
+
+    #[test]
+    fn a_paint_the_page_has_outrun_is_not_shown() {
+        // Two turns while the first paint runs: the first picture is out of date and must not be shown.
+        let mut turned = slow_browser();
+        turned.page_step(1.0);
+        assert!(turned.try_frame().is_none());
+        turned.page_step(1.0);
+        let shown = turned.frame();
+
+        let mut straight = browser();
+        straight.page_step(1.0);
+        straight.page_step(1.0);
+        let expected = straight.frame();
+        assert_eq!(shown.gray, expected.gray);
+        assert_eq!(turned.scroll_pos(), straight.scroll_pos());
+    }
+}
+

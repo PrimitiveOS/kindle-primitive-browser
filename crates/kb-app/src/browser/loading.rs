@@ -137,9 +137,7 @@ impl Browser {
             .ok()
             .and_then(|u| u.fragment().map(str::to_owned))
         {
-            if let Some(page) = self.page.as_mut() {
-                page.scroll_to_fragment(&fragment);
-            }
+            self.page_on(move |p| p.scroll_to_fragment(&fragment));
         }
         self.follow_script_navigation();
         self.save_session();
@@ -149,7 +147,6 @@ impl Browser {
         Ok(())
     }
 
-    /// Build the page, waiting for resources with progress. Images are deferred.
     pub(super) fn build_page(&mut self, html: &str, base: &str, is_web: bool) {
         let source = html.to_string();
         self.find_matches.clear();
@@ -159,10 +156,6 @@ impl Browser {
         let prepared = prepare_html(html, &self.settings, is_web && !self.settings.images, scripts);
         // Stylesheets for print or the dark scheme are not applied to this screen.
         let prepared = if is_web { crate::html::drop_unmatched_stylesheet_links(&prepared) } else { prepared };
-        let html = prepared.as_str();
-        let stats = self.net.stats();
-        let mut pump = self.pump.take();
-        self.net.set_defer_images(true);
         let (w, h) = (self.width, self.height);
         // Web pages lay out at a phone width; internal pages and chrome keep device pixels.
         let css_width = if is_web {
@@ -170,51 +163,43 @@ impl Browser {
         } else {
             None
         };
-        let net = self.net.clone();
         // The browser's own pages (home with its logo) always show their images.
-        net.set_images_allowed(self.settings.images || !is_web);
-        let built = {
-            let mut waiting = || {
-                let req = stats.requested.load(std::sync::atomic::Ordering::Relaxed);
-                let done = stats.done.load(std::sync::atomic::Ordering::Relaxed);
-                let frac = if req == 0 {
-                    0.3
-                } else {
-                    0.3 + 0.6 * done as f32 / req as f32
-                };
-                match pump.as_mut() {
-                    Some(p) => p(frac, "Loading"),
-                    None => true,
+        self.net.set_images_allowed(self.settings.images || !is_web);
+        // The page on screen goes into the one-page cache before the new one replaces it.
+        self.stash_current(&self.url.clone());
+        let html_owned = prepared;
+        let base_owned = base.to_string();
+        // The page is built on the page worker. The wait keeps the progress strip and the cancel (a tap) going.
+        let built = self.host.build(move |slots, cancel| {
+            let net = slots.net.clone();
+            net.set_defer_images(true);
+            let mut waiting = || !cancel.load(std::sync::atomic::Ordering::Relaxed);
+            let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                Page::new_scaled(&html_owned, &base_owned, w, h, net.clone(), &mut waiting, css_width)
+            }));
+            net.set_defer_images(false);
+            let page = match built {
+                Ok(p) => p,
+                Err(_) => {
+                    let fallback = ui::error("Page error", "This page could not be shown.", "");
+                    Page::new(&fallback, &base_owned, w, h, net.clone(), &mut || true)
                 }
             };
-            std::panic::catch_unwind(AssertUnwindSafe(|| {
-                Page::new_scaled(html, base, w, h, net.clone(), &mut waiting, css_width)
-            }))
-        };
-        self.net.set_defer_images(false);
-        self.pump = pump;
-        let page = match built {
-            Ok(p) => p,
-            Err(_) => {
-                let fallback = ui::error("Page error", "This page could not be shown.", "");
-                Page::new(&fallback, base, w, h, self.net.clone(), &mut || true)
-            }
-        };
-        page.start_deferred_images();
-        self.stash_current(&self.url.clone());
+            page.start_deferred_images();
+            slots.page = Some(page);
+        });
+        if !built {
+            eprintln!("[page] the page worker is gone; the page is not shown");
+        }
         self.source = source;
         self.reader_source = None;
         self.reader = false;
         self.page_is_web = is_web;
-        self.page = Some(page);
     }
 
-    /// A script asked for another address (`location.href = …`, `location.replace()`), or the page is a
-    /// meta-refresh redirect: load that address in place of this one. Returns true when it did. Up to
-    /// five hops, so a redirect loop stops. A fragment-only change moves within the page instead.
     pub(super) fn follow_script_navigation(&mut self) -> bool {
         // history.pushState/replaceState: show each new address in order, and keep the history entries current.
-        for (url, replace, state) in self.page.as_ref().map(|p| p.take_url_changes()).unwrap_or_default() {
+        for (url, replace, state) in self.page_on(|p| p.take_url_changes()).unwrap_or_default() {
             self.url = url.clone();
             self.pushed_states.insert(url.clone(), (document_of(&self.page_url), state));
             if replace {
@@ -229,7 +214,7 @@ impl Browser {
             }
             self.save_session();
         }
-        if let Some(next) = self.page.as_mut().and_then(|p| p.take_navigation()) {
+        if let Some(next) = self.page_on(|p| p.take_navigation()).flatten() {
             self.pending_nav = Some(next);
         }
         let Some(next) = self.pending_nav.take() else { return false };
@@ -281,10 +266,8 @@ impl Browser {
                 Ok(result) => return Ok(result),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let frac = (0.05 + start.elapsed().as_secs_f32() / 8.0 * 0.2).min(0.25);
-                    if let Some(pump) = self.pump.as_mut() {
-                        if !pump(frac, "Connecting") {
-                            return Err(Cancelled);
-                        }
+                    if !self.host.pump_call(frac, "Connecting") {
+                        return Err(Cancelled);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -300,7 +283,7 @@ impl Browser {
             let _ = self.load(&url, Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)));
             return;
         }
-        let Some(html) = self.page.as_ref().and_then(|p| p.reader_html()) else {
+        let Some(html) = self.page_on(|p| p.reader_html()).flatten() else {
             return;
         };
         let base = self.url.clone();

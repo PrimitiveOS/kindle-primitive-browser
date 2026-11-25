@@ -16,8 +16,9 @@ use std::{
     panic::{self, AssertUnwindSafe},
     process::Command,
     rc::Rc,
+    sync::Arc,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{channel, Receiver, RecvTimeoutError, Sender},
     },
     thread,
@@ -171,6 +172,8 @@ enum Ev {
     Page(f64),
     Back,
     Forward,
+    /// The page worker finished a job: a paint or a prefetch. The page on screen can change now.
+    PageReady,
 }
 
 /// A touch that starts this close to the top edge (device pixels) is an edge swipe.
@@ -221,20 +224,39 @@ fn abs_range(file: &File, code: u16) -> Option<AbsInfo> {
     (rc == 0).then_some(info)
 }
 
+/// The axis range of a panel `size` pixels across, from 0 to size - 1.
+fn native_range(size: u32) -> AbsInfo {
+    AbsInfo { minimum: 0, maximum: size as i32 - 1, ..AbsInfo::default() }
+}
+
+/// A test input stream named in a file of the browser folder (`test-touch`, `test-buttons`): a FIFO that carries
+/// recorded `input_event` records in place of the device's own input node. Absent on the device by default, so the
+/// browser reads its real touch and buttons. Used by the automated device tests (docs/07-device-tests.md).
+fn test_input(name: &str) -> Option<String> {
+    fs::read_to_string(format!("{DIR}/{name}"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn scale(raw: i32, info: &AbsInfo, out: u32) -> f32 {
     let span = (info.maximum - info.minimum).max(1) as f32;
     ((raw - info.minimum) as f32 / span * (out as f32 - 1.0)).clamp(0.0, out as f32 - 1.0)
 }
 
 /// Touch reader: taps, vertical drags (scroll), horizontal swipes (back/forward).
-fn touch_loop(path: String, tx: Sender<Ev>) {
+fn touch_loop(path: String, tx: Sender<Ev>, test: bool) {
     let mut file = match File::open(&path) {
         Ok(f) => f,
         Err(e) => return log(&format!("cannot open {path}: {e}")),
     };
-    let rx_info = abs_range(&file, ABS_MT_POSITION_X);
-    let ry_info = abs_range(&file, ABS_MT_POSITION_Y);
-    log(&format!("touch {path}: x={:?} y={:?}", rx_info.as_ref().map(|i| (i.minimum, i.maximum)), ry_info.as_ref().map(|i| (i.minimum, i.maximum))));
+    let (rx_info, ry_info) = if test {
+        // A test stream (a FIFO) has no axis ranges: the panel's own range (touch is 1:1 with the native pixels).
+        (Some(native_range(NATIVE_W)), Some(native_range(NATIVE_H)))
+    } else {
+        (abs_range(&file, ABS_MT_POSITION_X), abs_range(&file, ABS_MT_POSITION_Y))
+    };
+    log(&format!("touch {path}{}: x={:?} y={:?}", if test { " (test input)" } else { "" }, rx_info.as_ref().map(|i| (i.minimum, i.maximum)), ry_info.as_ref().map(|i| (i.minimum, i.maximum))));
     let (Some(xi), Some(yi)) = (rx_info, ry_info) else {
         return log("touch ranges unavailable");
     };
@@ -313,32 +335,59 @@ fn touch_loop(path: String, tx: Sender<Ev>) {
     }
 }
 
-/// Page-turn buttons (gpio-keys). Press only; repeats ignored.
-fn button_loop(path: String, tx: Sender<Ev>) {
+/// How long a page-turn press waits: if the other page button goes down within it, the two are one chord (both held
+/// to restart the launcher) and no page turns.
+const CHORD_WINDOW: Duration = Duration::from_millis(120);
+
+/// Page-turn buttons (gpio-keys). Press only; repeats ignored. A press turns the page after `CHORD_WINDOW`, unless the
+/// other page button goes down first.
+fn button_loop(path: String, tx: Sender<Ev>, test: bool) {
     let mut file = match File::open(&path) {
         Ok(f) => f,
         Err(e) => return log(&format!("cannot open {path}: {e}")),
     };
-    log(&format!("buttons {path} open"));
+    log(&format!("buttons {path} open{}", if test { " (test input)" } else { "" }));
+    // Each press or chord change gets a new number; a scheduled turn sends only if its number is still the latest.
+    let generation = Arc::new(AtomicU64::new(0));
+    // Index 0 is the forward button (KEY_PAGEDOWN), 1 the back button (KEY_PAGEUP).
+    let mut held = [false; 2];
     loop {
         let Some(ev) = read_event(&mut file) else {
             return log("button read failed");
         };
-        if ev.kind == EV_KEY {
-            log(&format!("key code={} value={}", ev.code, ev.value));
-            if ev.value == 1 {
-                let swapped = page_buttons_swapped(PANEL_ROTA.load(Ordering::Relaxed));
-                let forward = if swapped { -1.0 } else { 1.0 };
-                let out = match ev.code {
-                    KEY_PAGEDOWN => Some(Ev::Page(forward)),
-                    KEY_PAGEUP => Some(Ev::Page(-forward)),
-                    _ => None,
-                };
-                if let Some(e) = out {
-                    let _ = tx.send(e);
-                }
-            }
+        if ev.kind != EV_KEY {
+            continue;
         }
+        log(&format!("key code={} value={}", ev.code, ev.value));
+        let index = match ev.code {
+            KEY_PAGEDOWN => 0,
+            KEY_PAGEUP => 1,
+            _ => continue,
+        };
+        if ev.value == 0 {
+            held[index] = false;
+            continue;
+        }
+        if ev.value != 1 {
+            continue;
+        }
+        held[index] = true;
+        let number = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if held[1 - index] {
+            // Both buttons down within the window: a chord, which turns no page.
+            continue;
+        }
+        let swapped = page_buttons_swapped(PANEL_ROTA.load(Ordering::Relaxed));
+        let forward = if swapped { -1.0 } else { 1.0 };
+        let turn = if index == 0 { forward } else { -forward };
+        let tx = tx.clone();
+        let generation = Arc::clone(&generation);
+        thread::spawn(move || {
+            thread::sleep(CHORD_WINDOW);
+            if generation.load(Ordering::SeqCst) == number {
+                let _ = tx.send(Ev::Page(turn));
+            }
+        });
     }
 }
 
@@ -703,15 +752,19 @@ fn main() {
         .unwrap_or_else(|| "kbp://home".into());
 
     let (tx, rx) = channel();
-    if let Some(path) = find_input(profile::ACTIVE.touch_name) {
+    let touch_test = test_input("test-touch");
+    if let Some(path) = touch_test.clone().or_else(|| find_input(profile::ACTIVE.touch_name)) {
         let t = tx.clone();
-        thread::spawn(move || touch_loop(path, t));
+        let test = touch_test.is_some();
+        thread::spawn(move || touch_loop(path, t, test));
     } else {
         log("no touch device found");
     }
-    if let Some(path) = find_input("gpio-keys") {
+    let buttons_test = test_input("test-buttons");
+    if let Some(path) = buttons_test.clone().or_else(|| find_input("gpio-keys")) {
         let t = tx.clone();
-        thread::spawn(move || button_loop(path, t));
+        let test = buttons_test.is_some();
+        thread::spawn(move || button_loop(path, t, test));
     } else {
         log("no page-button device found");
     }
@@ -731,15 +784,22 @@ fn main() {
     log(&format!("turn at start: rota {turn} (framework {framework:?}, framebuffer {framebuffer:?})"));
     thread::spawn(display_turn_watch);
     let mut b = Browser::new(NATIVE_W, NATIVE_H);
+    // The page worker wakes the input loop when a paint or prefetch is finished.
+    let wake_tx = tx.clone();
+    b.set_waker(Arc::new(move || {
+        let _ = wake_tx.send(Ev::PageReady);
+    }));
     b.set_system_theme(system_dark());
     b.set_pump(Box::new(move |fraction, label| {
         let mut s = pump_state.borrow_mut();
         let mut interrupted = false;
         while let Ok(ev) = s.rx.try_recv() {
+            // A finished paint is not input: it waits its turn and does not cut a load short.
+            let is_input = !matches!(ev, Ev::PageReady);
             s.pending.push_back(ev);
             // While the document itself is still downloading, input waits for it.
             // Only the resource phase is cut short by a tap.
-            interrupted = label != "Connecting";
+            interrupted |= is_input && label != "Connecting";
         }
         if interrupted {
             return false;
@@ -774,8 +834,9 @@ fn main() {
             log("redraw requested by the launcher");
             b.set_system_theme(system_dark());
             b.redraw_all_calm();
-            let u = b.frame();
-            shared.borrow_mut().display.show(&u);
+            if let Some(u) = b.try_frame() {
+                shared.borrow_mut().display.show(&u);
+            }
         }
         tuning.reload();
         shared.borrow_mut().display.direct = tuning.direct;
@@ -827,6 +888,15 @@ fn main() {
             b.set_system_theme(system_dark());
             b.redraw_all_calm();
         }
+        if let Ev::PageReady = ev {
+            // The page worker finished a paint: show the page if it was waiting for one.
+            if let Some(u) = b.page_ready() {
+                log(&format!("page ready, rows {:?}, wave {:?}", u.rows, u.wave));
+                shared.borrow_mut().display.show(&u);
+            }
+            idle = SOON;
+            continue;
+        }
         let t_action = Instant::now();
         idle = SOON;
         log(&format!("event {ev:?}"));
@@ -847,21 +917,29 @@ fn main() {
                 Ev::Page(d) => b.page_step(d),
                 Ev::Back => b.back(),
                 Ev::Forward => b.forward(),
+                // Handled before the match: a finished paint is not an action.
+                Ev::PageReady => {}
             }
             let action_ms = t_action.elapsed();
             let t_frame = Instant::now();
-            let update = b.frame();
-            log(&format!(
-                "action {action_ms:?}, frame {:?}, rows {:?}, wave {:?}, rss {} kB",
-                t_frame.elapsed(),
-                update.rows,
-                update.wave,
-                rss_kb()
-            ));
+            // The bars and menus show now; a page change waits for its paint (`PageReady`).
+            let update = b.try_frame();
+            if let Some(update) = &update {
+                log(&format!(
+                    "action {action_ms:?}, frame {:?}, rows {:?}, wave {:?}, rss {} kB",
+                    t_frame.elapsed(),
+                    update.rows,
+                    update.wave,
+                    rss_kb()
+                ));
+            } else {
+                log(&format!("action {action_ms:?}, page paint in flight, rss {} kB", rss_kb()));
+            }
             update
         }));
         match outcome {
-            Ok(update) => shared.borrow_mut().display.show(&update),
+            Ok(Some(update)) => shared.borrow_mut().display.show(&update),
+            Ok(None) => {}
             Err(_) => log("recovered from a panic while handling an event"),
         }
         if b.exit_requested() {

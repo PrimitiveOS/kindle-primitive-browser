@@ -39,7 +39,7 @@ impl Browser {
         eprintln!(
             "[ui] action {href} (sheet={:?}, page={}, url={})",
             self.sheet,
-            self.page.is_some(),
+            self.has_page(),
             self.url
         );
         // Sheet rows and tiles can link straight to a page (Bookmarks, Saved pages, Home).
@@ -97,7 +97,7 @@ impl Browser {
                 self.settings.page_wave = w.to_string();
                 self.settings.save();
                 self.sheet_layer = None;
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             }
             return;
         }
@@ -106,14 +106,16 @@ impl Browser {
                 self.settings.ui_wave = w.to_string();
                 self.settings.save();
                 self.sheet_layer = None;
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             }
             return;
         }
         if let Some(index) = href.strip_prefix("kb:pick:").and_then(|s| s.parse::<usize>().ok()) {
-            if let (Some(key), Some(page)) = (self.choice_key.take(), self.page.as_mut()) {
-                page.select_pick(key, index);
-                self.mark_page_dirty();
+            if let Some(key) = self.choice_key.take() {
+                if self.has_page() {
+                    self.page_on(move |p| p.select_pick(key, index));
+                    self.mark_page_dirty();
+                }
             }
             self.sheet = None;
             self.touch(0, self.height, Wave::Text);
@@ -164,7 +166,7 @@ impl Browser {
             "kb:newtab" => self.new_tab(),
             "kb:closemenu" => {
                 self.sheet = None;
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             }
             "kb:reader" => {
                 self.toggle_reader();
@@ -201,7 +203,7 @@ impl Browser {
                 self.settings.page_dither = href.ends_with(":on");
                 self.settings.save();
                 self.sheet_layer = None;
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             }
             "kb:wave:lines:on" | "kb:wave:lines:off" => {
                 self.settings.book_lines = href.ends_with(":on");
@@ -214,13 +216,13 @@ impl Browser {
                 self.settings.solid_text = href.ends_with(":on");
                 self.settings.save();
                 self.sheet_layer = None;
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             }
             "kb:wave:flash:on" | "kb:wave:flash:off" => {
                 self.settings.flash_on_load = href.ends_with(":on");
                 self.settings.save();
                 self.sheet_layer = None;
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             }
             "kb:images" => {
                 self.settings.images = !self.settings.images;
@@ -247,12 +249,12 @@ impl Browser {
             "kb:clearhistory" => {
                 self.visits.clear();
                 write_pairs(&data_file("history.tsv"), &self.visits);
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
                 self.notify("History cleared");
             }
             "kb:clearcache" => {
                 store::cache_clear();
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
                 self.sheet_layer = None;
                 self.notify("Cache cleared");
             }
@@ -319,7 +321,7 @@ impl Browser {
     /// The panel changed a value: redraw it.
     fn quick_changed(&mut self) {
         self.quick_layer = None;
-        self.touch(0, QUICK_H, Wave::Text);
+        self.touch_chrome(0, QUICK_H, Wave::Text);
     }
 
     pub(super) fn set_night(&mut self, on: bool) {

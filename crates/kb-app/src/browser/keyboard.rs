@@ -75,7 +75,8 @@ impl Browser {
         self.select_all = !is_home;
         self.layer = Layer::Lower;
         self.refresh_suggestions();
-        self.touch(0, self.height, Wave::Text);
+        // The keyboard is drawn from its own layers, not the page: it opens at once, even while a page is painted.
+        self.touch_chrome(0, self.height, Wave::Text);
     }
 
     pub(super) fn keyboard_action(&mut self, href: &str) {
@@ -167,9 +168,7 @@ impl Browser {
                     if let Some(key) = self.input_target.take() {
                         // Done: write the value back into the field. The form is sent by its own submit button.
                         self.masked = false;
-                        if let Some(page) = self.page.as_mut() {
-                            page.set_input_value(key, &text);
-                        }
+                        self.page_on(move |p| p.set_input_value(key, &text));
                         self.mark_page_dirty();
                         self.touch(0, self.height, Wave::Text);
                     } else if !text.trim().is_empty() {
@@ -188,10 +187,10 @@ impl Browser {
             self.refresh_suggestions();
         }
         if field_changed {
-            self.touch(0, self.kb_y(), Wave::Text);
+            self.touch_chrome(0, self.kb_y(), Wave::Text);
         }
         if layer_changed {
-            self.touch(self.kb_y(), self.height, Wave::Text);
+            self.touch_chrome(self.kb_y(), self.height, Wave::Text);
         }
     }
 

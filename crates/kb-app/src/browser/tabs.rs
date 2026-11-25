@@ -50,8 +50,8 @@ impl Browser {
         self.sheet = None;
         // Tabs keep navigation metadata; only the active tab owns a live document.
         // Never reuse a different tab's DOM or its live-page cache, even for the same URL.
-        self.page = None;
-        self.previous = None;
+        self.host.ask(|slots| slots.page = None);
+        self.forget_previous();
         self.page_url.clear();
         // The HTML on screen belonged to the previous tab. Clear it so a load that is cancelled
         // leaves nothing to save or reflow under this tab's address.
@@ -66,9 +66,7 @@ impl Browser {
             // position (the top) in this slot.
             let saved = self.scrolls.get(self.idx).copied().unwrap_or(0.0);
             let _ = self.load(&url, Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)));
-            if let Some(page) = self.page.as_mut() {
-                page.scroll_to(saved);
-            }
+            self.page_on(move |p| p.scroll_to(saved));
             self.mark_page_dirty();
             self.touch(0, self.height, Wave::Text);
         }
@@ -93,7 +91,7 @@ impl Browser {
             self.scrolls.clear();
             self.idx = 0;
             self.open("kbp://home");
-            self.previous = None;
+            self.forget_previous();
         } else if n == self.active {
             let next = if n + 1 < self.tabs.len() {
                 n + 1

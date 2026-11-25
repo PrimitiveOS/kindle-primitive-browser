@@ -8,12 +8,18 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- The page is painted on its own thread (`browser/host.rs`, see `docs/06-page-worker.md`). The bars, menus, address
+  bar, keyboard and settings respond while a page is being painted.
+- Automated device tests (`tests/device/run.py`, `docs/07-device-tests.md`): the browser can read its touch and
+  buttons from test FIFOs named in its folder; absent by default.
 - Under Primitive Launcher the browser follows the system layer. The library entry declares `# Wake: redraw`, and
   the browser draws its whole screen again when the launcher asks (`SIGUSR1`). `Browser.sh` ignores the signal in
   its own shell.
 
 ### Changed
 
+- A page change waits for its paint; a change to the bars, sheets or keyboard is shown at once, over the picture on
+  screen. A page turn or scroll that needs a paint shows when the paint is finished.
 - Under Primitive Launcher the whole browser, bars and pages, follows the system's light or dark mode, and the
   Display sheet has no Day and Night. Opened alone, Night works as before.
 - Under Primitive Launcher the swipe down from the top edge opens the launcher's quick settings. The browser's own

@@ -56,12 +56,23 @@ pub(super) struct Cached {
     pub(super) gray: Vec<u8>,
 }
 
+/// The page kept for Back. Its document is on the page worker (`Slots::previous`).
 pub(super) struct PreviousPage {
     pub(super) url: String,
-    pub(super) page: Page,
     pub(super) source: String,
     pub(super) reader_source: Option<String>,
     pub(super) is_web: bool,
+}
+
+/// A paint or a prefetch sent to the page worker and not yet applied. It is applied only if the page
+/// has not changed since (`gen`), and its screen is cached under `key` (scroll position, chrome offset).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Flight {
+    pub(super) ticket: u64,
+    pub(super) gen: u64,
+    pub(super) key: (u64, u32),
+    /// The chrome offset the picture is painted with (a paint only; a prefetch keeps the key's offset).
+    pub(super) offset: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

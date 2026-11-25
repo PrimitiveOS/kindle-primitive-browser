@@ -4,7 +4,7 @@ members = ["crates/kb-net", "crates/kb-engine", "crates/kb-js", "crates/kb-app",
 exclude = ["spike"]
 
 [workspace.package]
-version = "0.2.21"
+version = "0.2.23"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 

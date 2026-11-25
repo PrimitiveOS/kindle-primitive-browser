@@ -114,9 +114,7 @@ impl Browser {
         // The position is read before loading, which would record the top of the new page.
         let saved_scroll = self.scrolls.get(self.idx).copied().unwrap_or(0.0);
         let _ = self.load(&t.url, Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)));
-        if let Some(page) = self.page.as_mut() {
-            page.scroll_to(saved_scroll);
-        }
+        self.page_on(move |p| p.scroll_to(saved_scroll));
         self.mark_page_dirty();
         self.touch(0, self.height, Wave::Text);
     }
