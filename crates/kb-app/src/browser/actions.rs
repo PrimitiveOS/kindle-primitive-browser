@@ -303,6 +303,7 @@ impl Browser {
 
     /// Open or close the quick settings panel (a swipe down from the top edge).
     pub fn quick_settings(&mut self) {
+        self.interrupt_loading();
         if self.quick {
             self.close_quick();
         } else if !self.keyboard {

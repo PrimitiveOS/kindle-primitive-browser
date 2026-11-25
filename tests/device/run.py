@@ -43,14 +43,15 @@ TABS = (670, 1628)  # bottom bar: the tabs
 OUT_DIR = None  # set by --out
 ABOVE_SHEET = (600, 300)  # a tap above an open sheet dismisses it
 EXIT_CONTROL = (1200, 920)  # the menu's Exit, in its header
+RELOAD = (150, 1060)  # the menu's Reload tile
 
 
 class Kindle:
     def __init__(self, host, port):
         self.host, self.port = host, port
         self.ctl = f"/tmp/kb-test-ctl-{os.getpid()}"
-        self.opts = ["-p", str(port), "-o", "StrictHostKeyChecking=accept-new",
-                     "-o", "ControlMaster=auto", "-o", f"ControlPath={self.ctl}", "-o", "ControlPersist=600"]
+        # One connection per command: a shared (multiplexed) connection stalled the harness when input streams were open.
+        self.opts = ["-p", str(port), "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15"]
 
     def run(self, command, data=None, timeout=60):
         """Run a shell command on the Kindle and return its stdout (text)."""
@@ -64,8 +65,7 @@ class Kindle:
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def close(self):
-        subprocess.run(["ssh", "-p", str(self.port), "-o", f"ControlPath={self.ctl}", "-O", "exit",
-                        f"root@{self.host}"], capture_output=True)
+        pass
 
     def log_size(self):
         return int(self.run(f"wc -c < '{LOG}' 2>/dev/null || echo 0").strip() or 0)
@@ -132,8 +132,11 @@ class Pen:
 def screenshot(kindle, path):
     """Save the Kindle's framebuffer (Y8, 1280-byte lines; the panel is 1264 x 1680) as a PNG."""
     import zlib
-    raw = subprocess.run(["ssh", *kindle.opts, f"root@{kindle.host}", "dd if=/dev/fb0 bs=1280 count=1680 2>/dev/null"],
-                         capture_output=True, timeout=120).stdout
+    try:
+        raw = subprocess.run(["ssh", *kindle.opts, f"root@{kindle.host}", "dd if=/dev/fb0 bs=1280 count=1680 2>/dev/null"],
+                             capture_output=True, timeout=45).stdout
+    except subprocess.TimeoutExpired:
+        return False
     width, height, stride = 1264, 1680, 1280
     if len(raw) < stride * height:
         return False
@@ -187,7 +190,9 @@ def start_browser(kindle, report):
                "case \"$c\" in *[k]b-kindle*|*[P]rimitive\\ Browser.sh*) kill -$sig ${p#/proc/} 2>/dev/null;; esac; done; sleep 2; done")
     kindle.run(f"printf '{FIFO_TOUCH}' > {BROWSER_DIR}/test-touch; printf '{FIFO_BUTTONS}' > {BROWSER_DIR}/test-buttons; "
                f"rm -f {FIFO_TOUCH} {FIFO_BUTTONS}; mkfifo {FIFO_TOUCH} {FIFO_BUTTONS}")
-    offset = kindle.log_size()
+    # The launcher script trims a large log when it starts, which would move the offsets used below: empty it first.
+    kindle.run(f": > '{LOG}'")
+    offset = 0
     kindle.run(f"cd {BROWSER_DIR} && PRIMITIVE_LAUNCHER=1 setsid sh '{START}' >/dev/null 2>&1 </dev/null &")
     # The browser's input threads open their FIFOs for reading and wait there for a writer, so the writers are
     # attached first (a FIFO open for writing meets its reader); the browser logs its input once both are open.
@@ -338,6 +343,22 @@ def main():
         if rss:
             report.info("resident memory (kB), first and last action", f"{rss[0]} -> {rss[-1]}, max {max(rss)}")
 
+        # 10b. A bar action while a page loads. Reload starts a real download from the menu; the bottom bar's menu is
+        #      tapped 150 ms later and must be handled before the page is ready.
+        touch.swipe((632, 600), (632, 720))
+        time.sleep(1.0)
+        touch.tap(*MENU)
+        time.sleep(1.0)
+        mark = kindle.log_size()
+        touch.tap(*RELOAD)
+        time.sleep(0.15)
+        touch.tap(*MENU)
+        wait_for(kindle, mark, r"page ready", timeout=30)
+        time.sleep(0.8)
+        verdict = load_responsive_verdict(kindle.log_since(mark))
+        report.check("bars answer while a page loads", verdict[0] is True, verdict[1])
+        time.sleep(0.8)
+
         # 11. The screen as the reader last saw it (kept with the results).
         if OUT_DIR:
             shot = screenshot(kindle, os.path.join(OUT_DIR, "screen-after-input.png"))
@@ -398,6 +419,20 @@ def bar_responsive_verdict(log):
     if ready is None or action < ready:
         return True, f"menu handled at log line {action}, paint still running (page ready at {ready})"
     return False, f"page ready at line {ready} came before the menu at {action}"
+
+def load_responsive_verdict(log):
+    """A reload started from the menu; the bottom bar's menu tapped during it must be handled before "page ready"."""
+    lines = log.splitlines()
+    reload_at = next((i for i, l in enumerate(lines) if "action kb:reload" in l), None)
+    if reload_at is None:
+        return False, "the reload was not handled"
+    ready = next((i for i, l in enumerate(lines) if i > reload_at and "page ready" in l), None)
+    menu = next((i for i, l in enumerate(lines) if i > reload_at and "[ui] action kb:menu" in l), None)
+    if menu is None:
+        return False, "the menu tap was not handled during the load"
+    if ready is not None and menu > ready:
+        return False, f"the menu came at line {menu}, after page ready at {ready}"
+    return True, f"menu handled at log line {menu}, page ready at {ready}"
 
 
 if __name__ == "__main__":

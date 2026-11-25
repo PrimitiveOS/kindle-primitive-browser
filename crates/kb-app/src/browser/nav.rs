@@ -27,6 +27,7 @@ impl Browser {
     }
 
     pub fn back(&mut self) {
+        self.interrupt_loading();
         if self.can_go_back() {
             self.remember_scroll();
             let prev = self.idx;
@@ -36,6 +37,7 @@ impl Browser {
     }
 
     pub fn forward(&mut self) {
+        self.interrupt_loading();
         if self.can_go_forward() {
             self.remember_scroll();
             let prev = self.idx;
@@ -81,13 +83,17 @@ impl Browser {
             return;
         }
         self.navigating_history = true;
-        let outcome = self.load(&url, Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)));
+        // The saved position is restored when the page is shown (the load returns at once).
+        let outcome = self.load_then(
+            &url,
+            Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)),
+            Box::new(move |b: &mut Browser| {
+                b.page_on(move |p| p.scroll_to(saved));
+            }),
+        );
         self.navigating_history = false;
-        match outcome {
-            Ok(()) => {
-                self.page_on(move |p| p.scroll_to(saved));
-            }
-            Err(Cancelled) => self.idx = prev,
+        if outcome.is_err() {
+            self.idx = prev;
         }
     }
 
@@ -131,29 +137,6 @@ impl Browser {
             }
         }
     }
-
-    pub(super) fn stash_current(&mut self, next_url: &str) {
-        if self.has_page() {
-            let keep = !self.page_url.is_empty() && self.page_url != next_url;
-            if keep {
-                self.previous = Some(PreviousPage {
-                    url: self.page_url.clone(),
-                    source: std::mem::take(&mut self.source),
-                    reader_source: self.reader_source.take(),
-                    is_web: self.page_is_web,
-                });
-            }
-            // The page worker moves the document the same way: kept for Back, or dropped.
-            self.host.ask(move |slots| {
-                let page = slots.page.take();
-                if keep {
-                    slots.previous = page;
-                }
-            });
-        }
-        self.page_url = next_url.to_string();
-    }
-
     /// Drop the page kept for Back (its document and its address).
     pub(super) fn forget_previous(&mut self) {
         self.previous = None;
@@ -170,7 +153,7 @@ impl Browser {
         let Some(previous) = self.previous.take() else {
             return false;
         };
-        // The page on screen goes into the cache (as `stash_current` does), and the kept page comes back.
+        // The page on screen goes into the cache (as a build does), and the kept page comes back.
         let keep = self.has_page() && !self.page_url.is_empty() && self.page_url != url;
         if keep {
             self.previous = Some(PreviousPage {
@@ -233,17 +216,25 @@ impl Browser {
         let scroll = self.page_on(|p| p.scroll_y()).unwrap_or(0.0);
         let source = self.source.clone();
         let reader_source = self.reader_source.clone();
-        let rendered = reader_source.as_deref().unwrap_or(&source);
+        let rendered = reader_source.clone().unwrap_or_else(|| source.clone());
         let base = self
             .page_on(|p| p.base_url().to_string())
             .unwrap_or_else(|| url.clone());
-        self.build_page(rendered, &base, self.page_is_web);
-        self.source = source;
-        self.reader = reader_source.is_some();
-        self.reader_source = reader_source;
-        self.page_on(move |p| p.scroll_to(scroll));
-        self.mark_page_dirty();
-        self.touch(0, self.height, Wave::Text);
+        let is_web = self.page_is_web;
+        // The page is laid out again on the worker; the reading position and the reader flag come back when it is shown.
+        self.build_then(
+            &rendered,
+            &base,
+            is_web,
+            Box::new(move |b: &mut Browser| {
+                b.source = source;
+                b.reader = reader_source.is_some();
+                b.reader_source = reader_source;
+                b.page_on(move |p| p.scroll_to(scroll));
+                b.mark_page_dirty();
+                b.touch(0, b.height, Wave::Text);
+            }),
+        );
     }
 
     /// Re-open the internal page on screen (home, bookmarks) so it shows the latest data.

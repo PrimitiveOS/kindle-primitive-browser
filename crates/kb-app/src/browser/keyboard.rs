@@ -1,5 +1,6 @@
 //! On-screen keyboard and address field: key layers, typing, the caret, and address suggestions.
 
+use super::types::{FIELD, KEY0, SUGGEST};
 use super::*;
 use crate::ui;
 
@@ -237,9 +238,7 @@ impl Browser {
         };
         if self.field.as_ref().map_or(true, |c| c.key != key) {
             let html = ui::field_bar(&shown, self.caret, self.select_all);
-            let mut c = self.render_layer(&html, "kb://keyboard/", self.width, TOP_H);
-            c.key = key;
-            self.field = Some(c);
+            self.post_layer(FIELD, key, html, "kb://keyboard/", self.width, TOP_H);
         }
         self.field.as_mut().expect("field layer")
     }
@@ -250,9 +249,8 @@ impl Browser {
         let key: String = self.suggestions.iter().map(|(u, _, _)| u.as_str()).collect::<Vec<_>>().join("\n");
         if self.suggest.as_ref().map_or(true, |c| c.key != key) {
             let html = ui::field_list(&self.suggestions);
-            let mut c = self.render_layer(&html, "kb://keyboard/", self.width, self.kb_y() - TOP_H);
-            c.key = key;
-            self.suggest = Some(c);
+            let height = self.kb_y() - TOP_H;
+            self.post_layer(SUGGEST, key, html, "kb://keyboard/", self.width, height);
         }
         self.suggest.as_mut().expect("suggestion layer")
     }
@@ -269,17 +267,13 @@ impl Browser {
     }
 
     pub(super) fn ensure_key(&mut self, layer: Layer) -> &mut Cached {
+        // The key layers are drawn with the label the Go key shows (Go, Done or Find).
         let label = self.go_label();
-        if self.keys_label != label {
-            // The key layers were drawn with another label: draw them again.
-            self.keys = [None, None, None, None];
-            self.keys_label = label;
-        }
         let idx = layer as usize;
-        if self.keys[idx].is_none() {
-            let html = ui::keyboard_for(layer, self.go_label(), self.height - self.kb_y());
-            let c = self.render_layer(&html, "kb://keyboard/", self.width, self.height - self.kb_y());
-            self.keys[idx] = Some(c);
+        if self.keys[idx].as_ref().map_or(true, |c| c.key != label) {
+            let html = ui::keyboard_for(layer, label, self.height - self.kb_y());
+            let height = self.height - self.kb_y();
+            self.post_layer(KEY0 + idx, label.to_string(), html, "kb://keyboard/", self.width, height);
         }
         self.keys[idx].as_mut().expect("key layer")
     }

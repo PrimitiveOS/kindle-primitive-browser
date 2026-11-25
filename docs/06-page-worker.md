@@ -73,12 +73,45 @@ Inside the browser module:
   build (`cargo zigbuild --release -p kb-kindle --target armv7-unknown-linux-musleabihf`) compiles; the device
   itself is not tested here.
 
-## 6.5 Known limits
+## 6.5 Chrome worker
 
-- A tap on the page content, a page turn and a link highlight call the page worker and wait for it. If a paint
-  or a prefetch is running, they wait for it to finish (one paint at most, about 300 ms on the Oasis 3). The bars,
-  the menu, the address bar, the keyboard, the quick panel and the settings never wait.
-- Loads still run the page build on the worker while the UI thread waits; taps during the build cancel the
-  remaining resource loads, as before. Network fetches keep their own thread.
-- Each thread loads the font collection once (`kb-engine` keeps it per thread), so the device holds a second copy
-  of the fonts (about 2 MB of font files) for the UI thread's bars. Measure RSS on the device before a release.
+The chrome layers (bars, sheets, keyboard parts, quick panel, notice) are drawn on a second worker, the chrome
+worker (`Host<ChromeSlots>`). Each layer is a slot holding its `Page`. The UI thread keeps each layer's picture
+(`Cached.gray`) and its key. A layer that changes is drawn on the chrome worker and keeps its last picture until
+the new one is applied (`collect_chrome`), so a sheet never waits for its drawing: the screen shows the bars at once
+and the sheet when it is ready. Hit tests and scrolls of a layer go to its slot (`Cached.link_at` and friends).
+
+## 6.6 Loads without waiting
+
+A navigation no longer blocks the UI thread (`loading.rs`):
+
+1. The document downloads on its own thread (`Pending::Fetch`). The thread wakes the UI when it finishes.
+2. The page is built on the page worker as a job (`Pending::Build`), with a cancel flag. A tap or scroll sets it, so
+   the build stops waiting for images, as before.
+3. What used to run after a load (restoring the reading position, recording the visit, the session) is a
+   continuation (`After`) that runs when the page is shown. A navigation started by the page itself chains onto it.
+4. While a load is pending the page on screen stays, and the progress strip under the address bar follows it.
+
+`frame()` (blocking, used by the desktop driver and the tests) waits for pending loads and chrome renders, so the
+driver sees the same results as before.
+
+## 6.7 Memory
+
+Measured on the desktop driver with a fixed session (`/usr/bin/time -l`): startup about 36 MB; a small article about
+39 MB; a large page (867 KB of HTML, 831k visible characters) about 112 MB. The committed and the current build
+use the same memory on the same session (about 130 MB). A page's memory grows with its text: the layout keeps the
+shaped text of the whole document. The chrome worker adds no measurable memory.
+
+Possible savings, not yet done (each costs responsiveness): keep only the key layer in use (about 2.7 MB);
+keep two prefetched screens instead of four (about 4 MB); drop the menu and tab pictures when they close (about
+2.5 MB, a blank area for about 300 ms when reopened). The Back cache is almost never filled (`stash` keeps a page
+only when its address differs from the new one's base), so Back reloads from the network: a known gap.
+
+## 6.8 Known limits
+
+- A tap on page content, a page turn and a link highlight call the page worker and wait for it. If a paint or a
+  prefetch is running, they wait for it to finish (one paint at most, about 300 ms on the Oasis 3). The bars,
+  the menu, the address bar, the keyboard, the quick panel and the settings never wait for a page.
+- A first render of a chrome layer that has not been drawn yet shows blank (white) until it arrives.
+- Each worker loads the font collection once (`kb-engine` keeps it per thread): the page worker and the chrome worker
+  hold a copy each (about 2 MB of font files).

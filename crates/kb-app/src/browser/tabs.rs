@@ -65,10 +65,16 @@ impl Browser {
             // Read the saved position first: loading saves the session, which records the new page's
             // position (the top) in this slot.
             let saved = self.scrolls.get(self.idx).copied().unwrap_or(0.0);
-            let _ = self.load(&url, Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)));
-            self.page_on(move |p| p.scroll_to(saved));
-            self.mark_page_dirty();
-            self.touch(0, self.height, Wave::Text);
+            // The position is restored when the page is shown (the load returns at once).
+            let _ = self.load_then(
+                &url,
+                Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)),
+                Box::new(move |b: &mut Browser| {
+                    b.page_on(move |p| p.scroll_to(saved));
+                    b.mark_page_dirty();
+                    b.touch(0, b.height, Wave::Text);
+                }),
+            );
         }
     }
 

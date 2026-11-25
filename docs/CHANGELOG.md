@@ -18,6 +18,8 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- Loading a page no longer blocks the bars, the menus or the settings: the download runs on its own thread, the page
+  is built on the page worker, and the chrome layers are drawn on their own worker (see `docs/06-page-worker.md`).
 - A page change waits for its paint; a change to the bars, sheets or keyboard is shown at once, over the picture on
   screen. A page turn or scroll that needs a paint shows when the paint is finished.
 - Under Primitive Launcher the whole browser, bars and pages, follows the system's light or dark mode, and the

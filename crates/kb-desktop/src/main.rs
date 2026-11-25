@@ -51,19 +51,6 @@ fn main() -> io::Result<()> {
     if std::env::var_os("KB_DEMO_DEVICE").is_some() {
         b.set_device(Box::new(DemoDevice));
     }
-    if std::env::var("KB_PROGRESS").is_ok() {
-        // Print the progress the device draws under the address bar (throttled).
-        let mut last = Instant::now() - Duration::from_secs(1);
-        let mut last_frac = -1.0f32;
-        b.set_pump(Box::new(move |frac, label| {
-            if last.elapsed() >= Duration::from_millis(100) || (frac - last_frac).abs() > 0.2 {
-                eprintln!("[progress] {label} {:>3.0}%", frac * 100.0);
-                last = Instant::now();
-                last_frac = frac;
-            }
-            true
-        }));
-    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let start = if args.is_empty() { "kbp://home".to_string() } else { args.join(" ") };
     // Without an address the browser resumes the tabs saved last time, as the device does.

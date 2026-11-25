@@ -113,10 +113,15 @@ impl Browser {
         // Restore from the cache first, so the browser comes back quickly even on a slow link.
         // The position is read before loading, which would record the top of the new page.
         let saved_scroll = self.scrolls.get(self.idx).copied().unwrap_or(0.0);
-        let _ = self.load(&t.url, Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)));
-        self.page_on(move |p| p.scroll_to(saved_scroll));
-        self.mark_page_dirty();
-        self.touch(0, self.height, Wave::Text);
+        let _ = self.load_then(
+            &t.url,
+            Policy::Cache(Duration::from_secs(60 * 60 * 24 * 7)),
+            Box::new(move |b: &mut Browser| {
+                b.page_on(move |p| p.scroll_to(saved_scroll));
+                b.mark_page_dirty();
+                b.touch(0, b.height, Wave::Text);
+            }),
+        );
     }
 }
 

@@ -1,12 +1,20 @@
 //! Composing the screen: bars, sheets, notices and the keyboard, the cached layers, the notice
 //! timer, and PNG output.
 
+use super::host::ChromeSlots;
+use super::types::{BOTTOM, FIELD, KEY0, QUICK, SHEET, SHEET_HEADER, SUGGEST, TOAST, TOP};
 use super::*;
 use crate::ui;
 
 pub(super) fn blit(dst: &mut [u8], width: u32, y: u32, src: &[u8], rows: u32) {
     let w = width as usize;
     let start = y as usize * w;
+    if src.is_empty() {
+        // A chrome layer not drawn yet shows as a blank (white) area.
+        let n = (rows as usize * w).min(dst.len().saturating_sub(start));
+        dst[start..start + n].fill(255);
+        return;
+    }
     let n = (rows as usize * w)
         .min(src.len())
         .min(dst.len().saturating_sub(start));
@@ -104,6 +112,13 @@ impl Browser {
     /// time is up. A page change it causes is shown when its paint finishes (`page_ready`).
     pub fn tick(&mut self) -> Option<Update> {
         self.collect();
+        // The progress strip follows a load in progress (it changes as the download and the images arrive).
+        let progress = self.load_progress();
+        if progress != self.progress && self.pending.is_some() {
+            self.progress = progress;
+            self.touch(0, TOP_H, Wave::Fast);
+            return self.try_frame();
+        }
         if self.paint.is_none() && self.prefetch.is_none() {
             self.prefetch_next_screen();
         }
@@ -182,13 +197,27 @@ impl Browser {
     pub fn frame(&mut self) -> Update {
         loop {
             self.collect();
+            if self.pending.is_some() {
+                // A load in progress: the page it shows is the one that arrives.
+                self.wait_pending();
+                continue;
+            }
             if self.paint.is_none() {
                 self.start_paint_if_needed();
-                if self.paint.is_none() {
-                    return self.compose_update(true);
-                }
             }
-            self.wait_paint();
+            if self.paint.is_some() {
+                self.wait_paint();
+                continue;
+            }
+            if !self.chrome_flights.is_empty() {
+                self.wait_chrome();
+                continue;
+            }
+            // Drawing the screen may start chrome renders (a sheet or a key layer that changed): wait for them too.
+            let update = self.compose_update(true);
+            if self.chrome_flights.is_empty() && self.paint.is_none() {
+                return update;
+            }
         }
     }
 
@@ -225,8 +254,9 @@ impl Browser {
         self.try_frame()
     }
 
-    /// Apply the paint and the prefetch the worker has finished. A result from an older state of the page is dropped.
     pub(super) fn collect(&mut self) {
+        self.collect_chrome();
+        self.poll_pending();
         if let Some(flight) = self.paint {
             if let Some(result) = self.host.take::<Vec<u8>>(flight.ticket) {
                 self.paint = None;
@@ -268,7 +298,8 @@ impl Browser {
     /// Get the picture of the page for the current scroll position and chrome offset: from the cache when it is
     /// there, otherwise by a paint on the worker (which `collect` applies). Does nothing when the page is current.
     pub(super) fn start_paint_if_needed(&mut self) {
-        if !self.page_dirty || self.paint.is_some() {
+        // A load in progress: the page on screen stays as it is until the new one is shown.
+        if !self.page_dirty || self.paint.is_some() || self.pending.is_some() {
             return;
         }
         let want = self.page_offset();
@@ -431,6 +462,10 @@ impl Browser {
             let (y0, _) = toast_rows(self.height);
             blit(&mut out, w, y0, &layer, 88);
         }
+        if let Some(fraction) = self.progress {
+            let y = if self.chrome { TOP_H - PROGRESS_H } else { 0 };
+            progress_strip(&mut out, w, y, fraction);
+        }
         if self.images_loading() {
             let s = self.net.stats();
             let done = s.deferred_done.load(std::sync::atomic::Ordering::Relaxed) as f32;
@@ -442,27 +477,11 @@ impl Browser {
     }
 
     pub(super) fn toast_layer(&mut self, message: &str) -> Vec<u8> {
-        if self
-            .toast_cache
-            .as_ref()
-            .map_or(true, |(m, _)| m != message)
-        {
+        if self.toast_cache.as_ref().map_or(true, |c| c.key != message) {
             let html = ui::toast(message);
-            let mut page = Page::new(
-                &html,
-                "kb://chrome/",
-                self.width,
-                88,
-                self.net.clone(),
-                &mut || true,
-            );
-            let gray = page.render_gray();
-            self.toast_cache = Some((message.to_string(), gray));
+            self.post_layer(TOAST, message.to_string(), html, "kb://chrome/", self.width, 88);
         }
-        self.toast_cache
-            .as_ref()
-            .map(|(_, g)| g.clone())
-            .unwrap_or_default()
+        self.toast_cache.as_ref().map(|c| c.gray.clone()).unwrap_or_default()
     }
 
     pub(super) fn compose_keyboard(&mut self) -> Vec<u8> {
@@ -478,13 +497,99 @@ impl Browser {
         out
     }
 
-    pub(super) fn render_layer(&self, html: &str, base: &str, w: u32, h: u32) -> Cached {
-        let mut page = Page::new(html, base, w, h, self.net.clone(), &mut || true);
-        let gray = page.render_gray();
-        Cached {
-            key: String::new(),
-            page,
-            gray,
+    /// Draw a chrome layer on the chrome worker. The layer keeps its last picture until the new one is applied
+    /// (`collect_chrome`), so the screen never shows a blank bar or sheet in between.
+    pub(super) fn post_layer(&mut self, slot: usize, key: String, html: String, base: &str, w: u32, h: u32) {
+        let net = self.net.clone();
+        let base = base.to_string();
+        let delay = self.chrome_host.paint_delay();
+        if let Some(ticket) = self.chrome_host.post(move |state: &mut ChromeSlots| {
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            let mut page = Page::new(&html, &base, w, h, net.clone(), &mut || true);
+            let gray = page.render_gray();
+            state.pages[slot] = Some(page);
+            gray
+        }) {
+            self.chrome_flights.push_back((ticket, slot));
+        }
+        let host = self.chrome_host.clone();
+        let field = self.layer_field(slot);
+        let gray = field.take().map(|c| c.gray).unwrap_or_default();
+        *field = Some(Cached { key, gray, slot, host });
+    }
+
+    /// The field holding a chrome layer (the keyboard keys by their index).
+    fn layer_field(&mut self, slot: usize) -> &mut Option<Cached> {
+        match slot {
+            TOP => &mut self.top,
+            BOTTOM => &mut self.bottom,
+            SHEET => &mut self.sheet_layer,
+            SHEET_HEADER => &mut self.sheet_header,
+            QUICK => &mut self.quick_layer,
+            FIELD => &mut self.field,
+            SUGGEST => &mut self.suggest,
+            TOAST => &mut self.toast_cache,
+            key => &mut self.keys[key - KEY0],
+        }
+    }
+
+    /// The rows of the screen a chrome layer is drawn on.
+    fn slot_rows(&self, slot: usize) -> (u32, u32) {
+        let h = self.height;
+        match slot {
+            TOP | FIELD => (0, TOP_H),
+            BOTTOM => (h - BOT_H, h),
+            SHEET => (h - MENU_H + SHEET_TITLE_H, h),
+            SHEET_HEADER => (h - MENU_H, h - MENU_H + SHEET_TITLE_H),
+            QUICK => (0, QUICK_H),
+            SUGGEST => (TOP_H, self.kb_y()),
+            TOAST => toast_rows(h),
+            _ => (self.kb_y(), h),
+        }
+    }
+
+    /// Show a finished chrome render (or scroll): its picture, and its rows as a change of the bars.
+    fn apply_chrome(&mut self, slot: usize, result: Option<Vec<u8>>) {
+        if let Some(gray) = result {
+            if let Some(cached) = self.layer_field(slot).as_mut() {
+                cached.gray = gray;
+            }
+        }
+        let (y0, y1) = self.slot_rows(slot);
+        self.touch_chrome(y0, y1, Wave::Text);
+    }
+
+    /// Apply the chrome renders the worker has finished, in the order they were sent.
+    pub(super) fn collect_chrome(&mut self) {
+        while let Some(&(ticket, slot)) = self.chrome_flights.front() {
+            let Some(result) = self.chrome_host.take::<Vec<u8>>(ticket) else { break };
+            self.chrome_flights.pop_front();
+            self.apply_chrome(slot, result);
+        }
+    }
+
+    /// Block until the oldest chrome render is applied.
+    pub(super) fn wait_chrome(&mut self) {
+        if let Some((ticket, slot)) = self.chrome_flights.pop_front() {
+            let result = self.chrome_host.wait::<Vec<u8>>(ticket);
+            self.apply_chrome(slot, result);
+        }
+    }
+
+    /// Scroll a chrome layer (a sheet or the suggestion list) and draw it again, on the chrome worker.
+    pub(super) fn layer_scroll(&mut self, slot: usize, dy: f64) {
+        if let Some(ticket) = self.chrome_host.post(move |state: &mut ChromeSlots| {
+            match state.pages.get_mut(slot).and_then(|p| p.as_mut()) {
+                Some(page) => {
+                    page.scroll_by(dy);
+                    page.render_gray_at(0)
+                }
+                None => Vec::new(),
+            }
+        }) {
+            self.chrome_flights.push_back((ticket, slot));
         }
     }
 
@@ -492,9 +597,7 @@ impl Browser {
         let key = format!("{}|{}", self.url, self.can_go_back());
         if self.top.as_ref().map_or(true, |c| c.key != key) {
             let html = ui::top(&self.url);
-            let mut c = self.render_layer(&html, "kb://chrome/", self.width, TOP_H);
-            c.key = key;
-            self.top = Some(c);
+            self.post_layer(TOP, key, html, "kb://chrome/", self.width, TOP_H);
         }
         self.top.as_mut().expect("top layer")
     }
@@ -516,9 +619,7 @@ impl Browser {
                 marked,
                 self.tabs.len().max(1),
             );
-            let mut c = self.render_layer(&html, "kb://chrome/", self.width, BOT_H);
-            c.key = key;
-            self.bottom = Some(c);
+            self.post_layer(BOTTOM, key, html, "kb://chrome/", self.width, BOT_H);
         }
         self.bottom.as_mut().expect("bottom layer")
     }
@@ -532,9 +633,7 @@ impl Browser {
         let key = format!("{:?}{:?}", self.device_status, on);
         if self.quick_layer.as_ref().map_or(true, |c| c.key != key) {
             let html = ui::quick_panel(&self.device_status, on);
-            let mut c = self.render_layer(&html, "kb://chrome/", self.width, QUICK_H);
-            c.key = key;
-            self.quick_layer = Some(c);
+            self.post_layer(QUICK, key, html, "kb://chrome/", self.width, QUICK_H);
         }
         self.quick_layer.as_mut().expect("quick layer")
     }
@@ -602,10 +701,7 @@ impl Browser {
                     self.settings.book_lines,
                 ),
             };
-            let mut c =
-                self.render_layer(&html, "kb://chrome/", self.width, MENU_H - SHEET_TITLE_H);
-            c.key = key;
-            self.sheet_layer = Some(c);
+            self.post_layer(SHEET, key, html, "kb://chrome/", self.width, MENU_H - SHEET_TITLE_H);
         }
         self.sheet_layer.as_mut().expect("sheet layer")
     }
@@ -626,9 +722,7 @@ impl Browser {
             // the page above them.
             let controls = if sheet == Sheet::Menu { ui::find_button() + &ui::exit_button() } else { String::new() };
             let html = ui::sheet_header(&title, &controls);
-            let mut c = self.render_layer(&html, "kb://chrome/", self.width, SHEET_TITLE_H);
-            c.key = title;
-            self.sheet_header = Some(c);
+            self.post_layer(SHEET_HEADER, title, html, "kb://chrome/", self.width, SHEET_TITLE_H);
         }
         self.sheet_header.as_mut().expect("sheet header")
     }

@@ -29,7 +29,7 @@ mod device;
 mod eink;
 mod profile;
 
-use kb_app::{Browser, Update, Wave, PROGRESS_H, TOP_H};
+use kb_app::{Browser, Update, Wave, TOP_H};
 
 const DIR: &str = "/mnt/us/browser";
 const FBINK: &str = "/mnt/us/browser/bin/fbink";
@@ -401,7 +401,6 @@ fn read_event(file: &mut File) -> Option<InputEvent> {
 /// Drawing to the panel. Regions are cropped to the rows that changed, and the
 /// waveform follows the kind of change (fast for chrome, text quality for pages).
 struct Display {
-    last_progress: Instant,
     /// When the last update was sent to the panel.
     last_draw: Instant,
     /// Draw in-process (true) or always with fbink (false); from the tuning file.
@@ -470,23 +469,6 @@ impl Display {
         }
         blit_region(x, width, y, rows, gray, wave, flash);
         "fbink"
-    }
-
-    /// Progress strip under the address bar. Cheap, and at most ten times a second.
-    fn progress(&mut self, fraction: f32) {
-        if self.last_progress.elapsed() < Duration::from_millis(100) {
-            return;
-        }
-        self.last_progress = Instant::now();
-        let w = NATIVE_W;
-        let mut strip = vec![200u8; (w * PROGRESS_H) as usize];
-        let fill = (fraction.clamp(0.0, 1.0) * w as f32) as usize;
-        for row in 0..PROGRESS_H as usize {
-            for x in 0..fill {
-                strip[row * w as usize + x] = 0;
-            }
-        }
-        self.blit(0, w, TOP_H - PROGRESS_H, PROGRESS_H, &strip, "DU", false);
     }
 }
 
@@ -772,12 +754,11 @@ fn main() {
     let shared = Rc::new(RefCell::new(Shared {
         rx,
         pending: VecDeque::new(),
-        display: Display { last_progress: Instant::now() - Duration::from_secs(1), last_draw: Instant::now(), direct: true, page_wave: "GC16".into(), ui_wave: "DU".into(), page_dither: false, solid_text: true, panel: open_panel() },
+        display: Display { last_draw: Instant::now(), direct: true, page_wave: "GC16".into(), ui_wave: "DU".into(), page_dither: false, solid_text: true, panel: open_panel() },
     }));
 
     // While a page loads, the progress strip is drawn and any tap cancels the wait,
     // so the input is handled right away instead of after the page finishes.
-    let pump_state = shared.clone();
     let (framework, framebuffer) = display_turn();
     let turn = framework.or(framebuffer).unwrap_or(0);
     PANEL_ROTA.store(turn, Ordering::Relaxed);
@@ -790,24 +771,6 @@ fn main() {
         let _ = wake_tx.send(Ev::PageReady);
     }));
     b.set_system_theme(system_dark());
-    b.set_pump(Box::new(move |fraction, label| {
-        let mut s = pump_state.borrow_mut();
-        let mut interrupted = false;
-        while let Ok(ev) = s.rx.try_recv() {
-            // A finished paint is not input: it waits its turn and does not cut a load short.
-            let is_input = !matches!(ev, Ev::PageReady);
-            s.pending.push_back(ev);
-            // While the document itself is still downloading, input waits for it.
-            // Only the resource phase is cut short by a tap.
-            interrupted |= is_input && label != "Connecting";
-        }
-        if interrupted {
-            return false;
-        }
-        s.display.progress(fraction);
-        true
-    }));
-
     // A navigation paints the address bar at once (the browser calls this before fetching).
     let draw_state = shared.clone();
     b.set_draw(Box::new(move |u| draw_state.borrow_mut().display.show(&u)));
@@ -818,9 +781,11 @@ fn main() {
     let t0 = Instant::now();
     // Resumes the tabs saved when the browser last left; `start` only when there are none.
     b.resume(&start);
-    let u = b.frame();
-    shared.borrow_mut().display.show(&u);
-    log(&format!("ready in {:?}: {}", t0.elapsed(), b.url()));
+    // The page arrives later (a download, then the build) and wakes the loop (`PageReady`).
+    if let Some(u) = b.try_frame() {
+        shared.borrow_mut().display.show(&u);
+    }
+    log(&format!("started loading in {:?}: {}", t0.elapsed(), b.url()));
 
     // How long to wait for input before an idle tick. Just after an event it is short, so the next screen is
     // prefetched soon after the panel has drawn this one rather than when the reader may already be pressing

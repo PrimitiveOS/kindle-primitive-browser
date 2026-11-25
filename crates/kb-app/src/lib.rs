@@ -22,7 +22,7 @@ pub use addr::normalize;
 pub use brand::NAME as BROWSER_NAME;
 pub use device::{DeviceControl, DeviceStatus, NoDevice, LEVEL_MAX};
 pub use primitive_quick::Stats;
-pub use browser::{encode_png, Browser, Cancelled, Pump, Update, Wave};
+pub use browser::{encode_png, Browser, Cancelled, Update, Wave};
 pub use layout::{kb_top, BOT_H, MENU_H, PROGRESS_H, QUICK_H, SHEET_TITLE_H, TOP_H};
 pub use settings::{width_name, PAGE_WIDTHS};
 pub(crate) use addr::split_url;

@@ -10,7 +10,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -18,18 +17,24 @@ use std::time::Duration;
 use kb_engine::Page;
 use kb_net::SyncNet;
 
-use super::types::Pump;
 
 /// Stack size of the worker. Layout of a large page recurses deeply; match the main thread's 8 MiB.
 const STACK: usize = 8 * 1024 * 1024;
-/// How often a build's wait checks its progress and the input.
-const TICK: Duration = Duration::from_millis(60);
 
 /// The pages the worker holds: the one on screen, and the one kept for Back.
 pub(super) struct Slots {
     pub(super) net: Arc<SyncNet>,
     pub(super) page: Option<Page>,
     pub(super) previous: Option<Page>,
+}
+
+/// Number of chrome layers (bars, sheets, keyboard parts, quick panel, notice); see the slot constants in `frame.rs`.
+pub(super) const CHROME_SLOTS: usize = 12;
+
+/// The chrome worker's documents: one `Page` per chrome layer slot. Chrome renders never wait behind a page paint:
+/// they run on their own worker (see docs/06-page-worker.md, 6.6).
+pub(super) struct ChromeSlots {
+    pub(super) pages: Vec<Option<Page>>,
 }
 
 /// Facts about the page on screen that the UI thread reads without waiting. Refreshed as each job
@@ -46,7 +51,7 @@ pub(super) struct Mirror {
 /// Called by the worker after each job finishes (the device wakes its input loop with it).
 pub(super) type Waker = Arc<dyn Fn() + Send + Sync>;
 
-type Work = Box<dyn FnOnce(&mut Slots) -> Box<dyn Any + Send> + Send>;
+type Work<S> = Box<dyn FnOnce(&mut S) -> Box<dyn Any + Send> + Send>;
 
 struct Done {
     ticket: u64,
@@ -54,32 +59,36 @@ struct Done {
     mirror: Mirror,
 }
 
-struct Inner {
-    jobs: mpsc::Sender<(u64, Work)>,
+struct Inner<S> {
+    jobs: mpsc::Sender<(u64, Work<S>)>,
     done: mpsc::Receiver<Done>,
     /// Finished jobs that nobody has taken yet, by ticket.
     finished: HashMap<u64, Done>,
     waker: Arc<Mutex<Option<Waker>>>,
     next: u64,
     mirror: Mirror,
-    net: Arc<SyncNet>,
-    pump: Option<Pump>,
     paint_delay: Duration,
 }
 
-/// The UI thread's handle on the page worker. Cloning it shares the same worker.
-#[derive(Clone)]
-pub(super) struct Host(Rc<RefCell<Inner>>);
+/// The UI thread's handle on a worker that owns state `S`. Cloning it shares the same worker. `Host` alone is the
+/// page worker's handle.
+pub(super) struct Host<S: 'static = Slots>(Rc<RefCell<Inner<S>>>);
+
+impl<S: 'static> Clone for Host<S> {
+    fn clone(&self) -> Self {
+        Host(self.0.clone())
+    }
+}
 
 /// Wrap a typed job so that its result travels as `Option<R>`: `None` when the job panicked.
-fn wrap<R: Send + 'static>(f: impl FnOnce(&mut Slots) -> R + Send + 'static) -> Work {
-    Box::new(move |slots: &mut Slots| {
-        let value: Option<R> = catch_unwind(AssertUnwindSafe(|| f(slots))).ok();
+fn wrap<S, R: Send + 'static>(f: impl FnOnce(&mut S) -> R + Send + 'static) -> Work<S> {
+    Box::new(move |state: &mut S| {
+        let value: Option<R> = catch_unwind(AssertUnwindSafe(|| f(state))).ok();
         Box::new(value) as Box<dyn Any + Send>
     })
 }
 
-fn snapshot(slots: &Slots) -> Mirror {
+fn snapshot_page(slots: &Slots) -> Mirror {
     match slots.page.as_ref() {
         Some(p) => Mirror {
             has_page: true,
@@ -92,23 +101,51 @@ fn snapshot(slots: &Slots) -> Mirror {
     }
 }
 
-impl Host {
-    /// Start the worker. If the thread cannot start, every job fails at once (`None`), so the browser
-    /// shows blank pages instead of waiting forever.
-    pub(super) fn new(net: Arc<SyncNet>) -> Host {
-        let (jobs, job_rx) = mpsc::channel::<(u64, Work)>();
+fn snapshot_none<S>(_: &S) -> Mirror {
+    Mirror::default()
+}
+
+impl Host<Slots> {
+    /// The page worker. Its pages are built and painted on its own thread (see docs/06-page-worker.md).
+    pub(super) fn new(net: Arc<SyncNet>) -> Host<Slots> {
+        Host::spawn("page-worker", net, |net| Slots { net, page: None, previous: None }, snapshot_page)
+    }
+}
+
+impl Host<ChromeSlots> {
+    /// The chrome worker: the bars, sheets, keyboard parts and notice are rendered here, not on the UI thread.
+    pub(super) fn chrome(net: Arc<SyncNet>) -> Host<ChromeSlots> {
+        Host::spawn(
+            "chrome-worker",
+            net,
+            |_| ChromeSlots { pages: (0..CHROME_SLOTS).map(|_| None).collect() },
+            snapshot_none,
+        )
+    }
+}
+
+impl<S: 'static> Host<S> {
+    /// Start a worker that owns the state `make` builds. If the thread cannot start, every job fails at once (`None`),
+    /// so the browser shows blank pages instead of waiting forever.
+    fn spawn(
+        name: &str,
+        net: Arc<SyncNet>,
+        make: impl FnOnce(Arc<SyncNet>) -> S + Send + 'static,
+        snapshot: fn(&S) -> Mirror,
+    ) -> Host<S> {
+        let (jobs, job_rx) = mpsc::channel::<(u64, Work<S>)>();
         let (done_tx, done) = mpsc::channel::<Done>();
         let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
         let worker_waker = waker.clone();
         let worker_net = net.clone();
         let spawned = thread::Builder::new()
-            .name("page-worker".into())
+            .name(name.into())
             .stack_size(STACK)
             .spawn(move || {
-                let mut slots = Slots { net: worker_net, page: None, previous: None };
+                let mut state = make(worker_net);
                 for (ticket, work) in job_rx {
-                    let value = work(&mut slots);
-                    let mirror = snapshot(&slots);
+                    let value = work(&mut state);
+                    let mirror = snapshot(&state);
                     if done_tx.send(Done { ticket, value, mirror }).is_err() {
                         break;
                     }
@@ -119,7 +156,7 @@ impl Host {
                 }
             });
         if spawned.is_err() {
-            eprintln!("[page] the page worker could not start");
+            eprintln!("[page] the worker {name} could not start");
         }
         Host(Rc::new(RefCell::new(Inner {
             jobs,
@@ -128,14 +165,14 @@ impl Host {
             waker,
             next: 0,
             mirror: Mirror::default(),
-            net,
-            pump: None,
             paint_delay: Duration::ZERO,
         })))
     }
 
     /// The facts about the page on screen, as of the last job that finished.
+    /// Takes in the jobs that have finished first, so the facts are those of the last finished job.
     pub(super) fn mirror(&self) -> Mirror {
+        self.poll();
         self.0.borrow().mirror.clone()
     }
 
@@ -145,18 +182,8 @@ impl Host {
         }
     }
 
-    pub(super) fn set_pump(&self, pump: Pump) {
-        self.0.borrow_mut().pump = Some(pump);
-    }
-
-    /// Ask the pump (progress and input) on behalf of a wait. True when no pump is set.
-    pub(super) fn pump_call(&self, fraction: f32, label: &str) -> bool {
-        match self.0.borrow_mut().pump.as_mut() {
-            Some(pump) => pump(fraction, label),
-            None => true,
-        }
-    }
-
+ 
+ 
     /// Extra time each paint takes on the worker. Tests use it to hold a paint in flight.
     pub(super) fn paint_delay(&self) -> Duration {
         self.0.borrow().paint_delay
@@ -171,7 +198,7 @@ impl Host {
     /// paint in progress delays it. `None` when the job panicked or the worker is gone.
     pub(super) fn ask<R: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Slots) -> R + Send + 'static,
+        f: impl FnOnce(&mut S) -> R + Send + 'static,
     ) -> Option<R> {
         let ticket = self.post(f)?;
         self.wait(ticket)
@@ -180,12 +207,12 @@ impl Host {
     /// Queue `f` on the worker and return at once with its ticket.
     pub(super) fn post<R: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Slots) -> R + Send + 'static,
+        f: impl FnOnce(&mut S) -> R + Send + 'static,
     ) -> Option<u64> {
         let mut inner = self.0.borrow_mut();
         inner.next += 1;
         let ticket = inner.next;
-        inner.jobs.send((ticket, wrap(f))).ok().map(|_| ticket)
+        inner.jobs.send((ticket, wrap::<S, R>(f))).ok().map(|_| ticket)
     }
 
     /// Take in every job that has finished, without waiting.
@@ -216,39 +243,6 @@ impl Host {
         }
     }
 
-    /// Build a page on the worker, waiting for it with the pump: the pump reports progress and can
-    /// cancel the wait (its `false` sets the flag the build checks). Returns false if the worker is gone.
-    pub(super) fn build(
-        &self,
-        work: impl FnOnce(&mut Slots, &AtomicBool) + Send + 'static,
-    ) -> bool {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
-        let Some(ticket) = self.post(move |slots: &mut Slots| work(slots, &flag)) else {
-            return false;
-        };
-        let net = self.0.borrow().net.clone();
-        loop {
-            if self.take_finished::<()>(ticket).is_some() {
-                return true;
-            }
-            let received = self.0.borrow().done.recv_timeout(TICK);
-            match received {
-                Ok(done) => self.0.borrow_mut().absorb(done),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let s = net.stats();
-                    let req = s.requested.load(Ordering::Relaxed);
-                    let done = s.done.load(Ordering::Relaxed);
-                    let fraction = if req == 0 { 0.3 } else { 0.3 + 0.6 * done as f32 / req as f32 };
-                    if !self.pump_call(fraction, "Loading") {
-                        cancel.store(true, Ordering::Relaxed);
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
-            }
-        }
-    }
-
     fn take_finished<R: 'static>(&self, ticket: u64) -> Option<Option<R>> {
         let done = self.0.borrow_mut().finished.remove(&ticket)?;
         Some(match done.value.downcast::<Option<R>>() {
@@ -258,7 +252,7 @@ impl Host {
     }
 }
 
-impl Inner {
+impl<S> Inner<S> {
     fn absorb(&mut self, done: Done) {
         self.mirror = done.mirror.clone();
         self.finished.insert(done.ticket, done);
@@ -268,7 +262,7 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn host() -> Host {
         Host::new(Arc::new(SyncNet::new(1024 * 1024)))

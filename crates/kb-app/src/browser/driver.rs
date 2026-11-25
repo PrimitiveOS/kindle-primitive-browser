@@ -17,28 +17,28 @@ impl Browser {
         let centre = |(x, y, w, h): (f32, f32, f32, f32)| (x + w / 2.0, y + h / 2.0);
         if self.quick && !self.keyboard {
             // The panel covers the top of the screen, so only its own elements count.
-            let (x, y) = centre(self.ensure_quick().page.element_box(selector)?);
+            let (x, y) = centre(self.ensure_quick().element_box(selector)?);
             return Some((x, y));
         }
         if self.keyboard {
-            if let Some(b) = self.ensure_field().page.element_box(selector) {
+            if let Some(b) = self.ensure_field().element_box(selector) {
                 return Some(centre(b));
             }
             // A suggestion counts as on screen only where the list shows it (above the keys).
-            if let Some(b) = self.ensure_suggestions().page.element_box(selector) {
+            if let Some(b) = self.ensure_suggestions().element_box(selector) {
                 let (x, y) = centre(b);
                 let y = y + TOP_H as f32;
                 return (y >= TOP_H as f32 && y < self.kb_y() as f32).then_some((x, y));
             }
-            let (x, y) = centre(self.ensure_key(self.layer).page.element_box(selector)?);
+            let (x, y) = centre(self.ensure_key(self.layer).element_box(selector)?);
             return Some((x, y + self.kb_y() as f32));
         }
         if let Some(sheet) = self.sheet {
-            if let Some(b) = self.ensure_sheet_header(sheet).page.element_box(selector) {
+            if let Some(b) = self.ensure_sheet_header(sheet).element_box(selector) {
                 let (x, y) = centre(b);
                 return Some((x, y + (self.height - MENU_H) as f32));
             }
-            let (x, y) = centre(self.ensure_sheet(sheet).page.element_box(selector)?);
+            let (x, y) = centre(self.ensure_sheet(sheet).element_box(selector)?);
             return Some((x, y + (self.height - MENU_H + SHEET_TITLE_H) as f32));
         }
         let sel = selector.to_string();
