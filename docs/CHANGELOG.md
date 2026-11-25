@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
 ### Added
 
 - The page is painted on its own thread (`browser/host.rs`, see `docs/06-page-worker.md`). The bars, menus, address
