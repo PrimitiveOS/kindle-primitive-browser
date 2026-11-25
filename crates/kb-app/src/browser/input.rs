@@ -1,10 +1,12 @@
 //! Input: taps, long presses, scrolling, the press highlight, and hit testing for the bars,
 //! sheets, keyboard and page.
 
+use super::types::{SHEET, SUGGEST};
 use super::*;
 
 impl Browser {
     pub fn scroll(&mut self, dy: f64) {
+        self.interrupt_loading();
         // A swipe while the quick settings panel is open dismisses it, as on the Kindle.
         if self.quick && !self.keyboard {
             if dy.abs() > 8.0 {
@@ -14,18 +16,16 @@ impl Browser {
         }
         if self.keyboard {
             // The suggestion list scrolls; the address bar and the keys stay put.
-            let cached = self.ensure_suggestions();
-            cached.page.scroll_by(dy);
-            cached.gray = cached.page.render_gray_at(0);
-            self.touch(TOP_H, self.kb_y(), Wave::Text);
+            self.ensure_suggestions();
+            self.layer_scroll(SUGGEST, dy);
+            self.touch_chrome(TOP_H, self.kb_y(), Wave::Text);
             return;
         }
         // An open sheet (menu, tabs) takes the swipe and scrolls its own list.
         if let Some(sheet) = self.sheet {
-            let cached = self.ensure_sheet(sheet);
-            cached.page.scroll_by(dy);
-            cached.gray = cached.page.render_gray_at(0);
-            self.touch(self.height - MENU_H, self.height, Wave::Text);
+            self.ensure_sheet(sheet);
+            self.layer_scroll(SHEET, dy);
+            self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             return;
         }
         // Scrolling down hides the bars to give the page room; scrolling up brings them back.
@@ -34,9 +34,9 @@ impl Browser {
         } else if dy < -8.0 && !self.chrome {
             self.set_chrome(true);
         }
-        if let Some(page) = self.page.as_mut() {
-            page.scroll_by(dy);
-            self.page_dirty = true;
+        if self.has_page() {
+            self.page_on(move |p| p.scroll_by(dy));
+            self.page_changed();
             self.touch(0, self.height, Wave::Text);
         }
     }
@@ -45,7 +45,8 @@ impl Browser {
     /// the new screen on the rows of the old one (see `lines`). A turn forward hides the bars; a turn back
     /// leaves them as they are (they would move the page by their height, off the line rows).
     pub fn page_step(&mut self, dir: f64) {
-        if self.quick || self.keyboard || self.sheet.is_some() || self.page.is_none() {
+        self.interrupt_loading();
+        if self.quick || self.keyboard || self.sheet.is_some() || !self.has_page() {
             // The panel, keyboard or sheet takes it as a swipe.
             self.scroll((self.height - TOP_H) as f64 * 0.9 * dir);
             return;
@@ -54,32 +55,33 @@ impl Browser {
         if dir > 0.0 && self.chrome {
             self.set_chrome(false);
         }
-        if let Some(page) = self.page.as_mut() {
-            page.scroll_by(step);
-            self.page_dirty = true;
+        if self.has_page() {
+            self.page_on(move |p| p.scroll_by(step));
+            self.page_changed();
             self.touch(0, self.height, Wave::Text);
         }
     }
 
-    /// How far a page turn scrolls (device pixels). Aligned to the page's text lines; without text, a whole
-    /// screen without overlap: forward the next screen starts where the visible part ended, back it ends
-    /// where the visible part began.
     pub(super) fn turn_distance(&self, dir: f64) -> f64 {
         let top = self.page_offset() as f64;
         let bottom = if self.chrome { self.height - BOT_H } else { self.height } as f64;
         // Forward hides the bars; back keeps them as they are.
         let (next_top, next_bottom) = if dir > 0.0 { (0.0, self.height as f64) } else { (top, bottom) };
         let plain = if dir > 0.0 { bottom - top } else { -(next_bottom - next_top) };
-        let Some(page) = self.page.as_ref() else { return plain };
+        let Some((scroll, max_scroll, text)) =
+            self.page_on(|p| (p.scroll_y(), p.max_scroll(), p.text_lines()))
+        else {
+            return plain;
+        };
         let turn = lines::Turn {
-            scroll: page.scroll_y(),
-            max_scroll: page.max_scroll(),
+            scroll,
+            max_scroll,
             top,
             bottom,
             next_top,
             next_bottom,
         };
-        match lines::turn_to(&page.text_lines(), &turn, dir) {
+        match lines::turn_to(&text, &turn, dir) {
             Some(to) => to - turn.scroll,
             None => plain,
         }
@@ -87,6 +89,7 @@ impl Browser {
 
     /// Long press on a link opens it in a new tab.
     pub fn long_press(&mut self, x: f32, y: f32) {
+        self.interrupt_loading();
         if self.keyboard
             || self.sheet.is_some()
             || y < TOP_H as f32
@@ -95,7 +98,7 @@ impl Browser {
             return;
         }
         let off = self.page_offset() as f32;
-        let href = self.page.as_ref().and_then(|p| p.link_at(x, y - off));
+        let href = self.page_on(move |p| p.link_at(x, y - off)).flatten();
         match href {
             Some(href) if !href.starts_with("kb:") => {
                 self.new_tab();
@@ -108,6 +111,7 @@ impl Browser {
 
     /// Step to the next (+1) or previous (-1) tab, wrapping around.
     pub fn tab_step(&mut self, dir: i32) {
+        self.interrupt_loading();
         let n = self.tabs.len().max(1) as i32;
         if n <= 1 {
             return;
@@ -124,11 +128,12 @@ impl Browser {
 
     /// Handle a tap at device pixel (x, y).
     pub fn tap(&mut self, x: f32, y: f32) {
+        self.interrupt_loading();
         let h = self.height as f32;
         if self.quick && !self.keyboard {
             // Links inside the panel act (brightness, warmth, Wi-Fi, close); a tap below it closes it.
             if y < QUICK_H as f32 {
-                if let Some(href) = self.ensure_quick().page.link_at(x, y) {
+                if let Some(href) = self.ensure_quick().link_at(x, y) {
                     self.chrome_action(&href);
                 }
             } else {
@@ -138,8 +143,8 @@ impl Browser {
         }
         if self.keyboard {
             if y < TOP_H as f32 {
-                let field_box = self.ensure_field().page.link_box(x, y);
-                if let Some(href) = self.ensure_field().page.link_at(x, y) {
+                let field_box = self.ensure_field().link_box(x, y);
+                if let Some(href) = self.ensure_field().link_at(x, y) {
                     if let Some(n) = href
                         .strip_prefix("kb:pos:")
                         .and_then(|v| v.parse::<usize>().ok())
@@ -148,20 +153,20 @@ impl Browser {
                         let right = field_box.map_or(false, |(bx, _, bw, _)| x > bx + bw / 2.0);
                         self.caret = (n + usize::from(right)).min(self.typed.len());
                         self.select_all = false;
-                        self.touch(0, TOP_H, Wave::Text);
+                        self.touch_chrome(0, TOP_H, Wave::Text);
                     } else {
                         self.keyboard_action(&href);
                     }
                 }
             } else if y < self.kb_y() as f32 {
                 // The suggestion list: a tap on a row opens it.
-                if let Some(href) = self.ensure_suggestions().page.link_at(x, y - TOP_H as f32) {
+                if let Some(href) = self.ensure_suggestions().link_at(x, y - TOP_H as f32) {
                     self.keyboard_action(&href);
                 }
             } else if let Some(href) = {
                 let kb = self.kb_y() as f32;
                 let layer = self.layer;
-                self.ensure_key(layer).page.link_at(x, y - kb)
+                self.ensure_key(layer).link_at(x, y - kb)
             } {
                 self.keyboard_action(&href);
             }
@@ -171,10 +176,9 @@ impl Browser {
             if y >= h - MENU_H as f32 {
                 let sy = y - (h - MENU_H as f32);
                 let href = if sy < SHEET_TITLE_H as f32 {
-                    self.ensure_sheet_header(sheet).page.link_at(x, sy)
+                    self.ensure_sheet_header(sheet).link_at(x, sy)
                 } else {
                     self.ensure_sheet(sheet)
-                        .page
                         .link_at(x, sy - SHEET_TITLE_H as f32)
                 };
                 eprintln!("[ui] sheet={sheet:?} tap ({x:.0},{y:.0}) -> {href:?}");
@@ -184,32 +188,34 @@ impl Browser {
                     }
                     self.chrome_action(&href);
                 }
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             } else {
                 eprintln!("[ui] sheet={sheet:?} dismissed by tap above sheet at y={y:.0}");
                 self.sheet = None;
-                self.touch(self.height - MENU_H, self.height, Wave::Text);
+                self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
             }
             return;
         }
         if self.chrome && y < TOP_H as f32 {
-            if let Some(href) = self.ensure_top().page.link_at(x, y) {
+            if let Some(href) = self.ensure_top().link_at(x, y) {
                 self.chrome_action(&href);
             }
             return;
         }
         if self.chrome && y >= (h - BOT_H as f32) {
-            if let Some(href) = self.ensure_bottom().page.link_at(x, y - (h - BOT_H as f32)) {
+            if let Some(href) = self.ensure_bottom().link_at(x, y - (h - BOT_H as f32)) {
                 self.chrome_action(&href);
             }
             return;
         }
         // Page content: taps map back from the screen to the page's own coordinates.
+        if !self.has_page() {
+            return;
+        }
         let y = y - self.page_offset() as f32;
-        let Some(page) = self.page.as_mut() else {
+        let Some(outcome) = self.page_on(move |p| p.click_at(x, y)) else {
             return;
         };
-        let outcome = page.click_at(x, y);
         if outcome == kb_engine::ClickKind::Prevented {
             self.mark_page_dirty();
             self.touch(0, self.height, Wave::Text);
@@ -220,13 +226,13 @@ impl Browser {
             return;
         }
         // Checkboxes and radio buttons change state on tap.
-        if self.page.as_mut().map_or(false, |p| p.toggle_choice_at(x, y)) {
+        if self.page_on(move |p| p.toggle_choice_at(x, y)).unwrap_or(false) {
             self.mark_page_dirty();
             self.touch(0, self.height, Wave::Text);
             return;
         }
         // A select opens its options in a sheet.
-        if let Some(select) = self.page.as_ref().and_then(|p| p.select_at(x, y)) {
+        if let Some(select) = self.page_on(move |p| p.select_at(x, y)).flatten() {
             self.choice_title = select.title;
             self.choice_options = select.options;
             self.choice_key = Some(select.key);
@@ -234,7 +240,7 @@ impl Browser {
             return;
         }
         // Text fields open the keyboard for editing; submit buttons send their form.
-        let field = self.page.as_ref().and_then(|p| p.input_at(x, y));
+        let field = self.page_on(move |p| p.input_at(x, y)).flatten();
         if let Some(field) = field {
             self.input_target = Some(field.key);
             self.masked = field.password;
@@ -244,12 +250,12 @@ impl Browser {
             self.caret = self.typed.len();
             self.layer = Layer::Lower;
             self.refresh_suggestions();
-            self.touch(0, self.height, Wave::Text);
+            self.touch_chrome(0, self.height, Wave::Text);
             return;
         }
-        if let Some(submit) = self.page.as_ref().and_then(|p| p.form_submit_at(x, y)) {
+        if let Some(submit) = self.page_on(move |p| p.form_submit_at(x, y)).flatten() {
             // A script may cancel the submit event; then the form is not sent.
-            if self.page.as_mut().map_or(true, |p| p.form_submit_allowed(x, y)) {
+            if self.page_on(move |p| p.form_submit_allowed(x, y)).unwrap_or(true) {
                 self.submit(submit);
             } else {
                 self.mark_page_dirty();
@@ -257,7 +263,7 @@ impl Browser {
             }
             return;
         }
-        let href = self.page.as_ref().and_then(|p| p.link_at(x, y));
+        let href = self.page_on(move |p| p.link_at(x, y)).flatten();
         match href {
             Some(href) if href.starts_with("kb:") => self.chrome_action(&href),
             Some(href) => self.open(&href),
@@ -279,7 +285,7 @@ impl Browser {
             // The page moves below the address bar when the bars are shown, so repaint it at text quality.
             // The page itself is unchanged: the cached screens are keyed by offset and stay valid, so the
             // cache is kept (clearing it here threw away the prefetched screens at every change of direction).
-            self.page_dirty = true;
+            self.page_changed();
             self.touch(0, self.height, Wave::Text);
         }
     }
@@ -297,6 +303,7 @@ impl Browser {
     /// registers before the action finishes. Returns the highlighted frame, or
     /// `None` when the point is not on a tappable element.
     pub fn press(&mut self, x: f32, y: f32) -> Option<Update> {
+        self.interrupt_loading();
         let (bx, by, bw, bh) = self.tappable_box(x, y)?;
         if self.last_gray.is_empty() {
             return None;
@@ -332,18 +339,17 @@ impl Browser {
         let h = self.height as f32;
         if self.keyboard {
             if y < TOP_H as f32 {
-                return self.ensure_field().page.link_box(x, y);
+                return self.ensure_field().link_box(x, y);
             }
             if y < self.kb_y() as f32 {
                 let (bx, by, bw, bh) = self
                     .ensure_suggestions()
-                    .page
                     .link_box(x, y - TOP_H as f32)?;
                 return Some((bx, by + TOP_H as f32, bw, bh));
             }
             let kb = self.kb_y() as f32;
             let layer = self.layer;
-            let (bx, by, bw, bh) = self.ensure_key(layer).page.link_box(x, y - kb)?;
+            let (bx, by, bw, bh) = self.ensure_key(layer).link_box(x, y - kb)?;
             return Some((bx, by + kb, bw, bh));
         }
         if let Some(sheet) = self.sheet {
@@ -351,27 +357,26 @@ impl Browser {
                 let top = h - MENU_H as f32;
                 if y < top + SHEET_TITLE_H as f32 {
                     let (bx, by, bw, bh) =
-                        self.ensure_sheet_header(sheet).page.link_box(x, y - top)?;
+                        self.ensure_sheet_header(sheet).link_box(x, y - top)?;
                     return Some((bx, by + top, bw, bh));
                 }
                 let body_top = top + SHEET_TITLE_H as f32;
-                let (bx, by, bw, bh) = self.ensure_sheet(sheet).page.link_box(x, y - body_top)?;
+                let (bx, by, bw, bh) = self.ensure_sheet(sheet).link_box(x, y - body_top)?;
                 return Some((bx, by + body_top, bw, bh));
             }
             return None;
         }
         if self.chrome && y < TOP_H as f32 {
-            return self.ensure_top().page.link_box(x, y);
+            return self.ensure_top().link_box(x, y);
         }
         if self.chrome && y >= h - BOT_H as f32 {
             let top = h - BOT_H as f32;
-            let (bx, by, bw, bh) = self.ensure_bottom().page.link_box(x, y - top)?;
+            let (bx, by, bw, bh) = self.ensure_bottom().link_box(x, y - top)?;
             return Some((bx, by + top, bw, bh));
         }
         let off = self.page_offset() as f32;
-        self.page
-            .as_ref()?
-            .link_box(x, y - off)
+        self.page_on(move |p| p.link_box(x, y - off))
+            .flatten()
             .map(|(bx, by, bw, bh)| (bx, by + off, bw, bh))
     }
 }

@@ -1,5 +1,6 @@
 //! On-screen keyboard and address field: key layers, typing, the caret, and address suggestions.
 
+use super::types::{FIELD, KEY0, SUGGEST};
 use super::*;
 use crate::ui;
 
@@ -75,7 +76,8 @@ impl Browser {
         self.select_all = !is_home;
         self.layer = Layer::Lower;
         self.refresh_suggestions();
-        self.touch(0, self.height, Wave::Text);
+        // The keyboard is drawn from its own layers, not the page: it opens at once, even while a page is painted.
+        self.touch_chrome(0, self.height, Wave::Text);
     }
 
     pub(super) fn keyboard_action(&mut self, href: &str) {
@@ -167,9 +169,7 @@ impl Browser {
                     if let Some(key) = self.input_target.take() {
                         // Done: write the value back into the field. The form is sent by its own submit button.
                         self.masked = false;
-                        if let Some(page) = self.page.as_mut() {
-                            page.set_input_value(key, &text);
-                        }
+                        self.page_on(move |p| p.set_input_value(key, &text));
                         self.mark_page_dirty();
                         self.touch(0, self.height, Wave::Text);
                     } else if !text.trim().is_empty() {
@@ -188,10 +188,10 @@ impl Browser {
             self.refresh_suggestions();
         }
         if field_changed {
-            self.touch(0, self.kb_y(), Wave::Text);
+            self.touch_chrome(0, self.kb_y(), Wave::Text);
         }
         if layer_changed {
-            self.touch(self.kb_y(), self.height, Wave::Text);
+            self.touch_chrome(self.kb_y(), self.height, Wave::Text);
         }
     }
 
@@ -238,9 +238,7 @@ impl Browser {
         };
         if self.field.as_ref().map_or(true, |c| c.key != key) {
             let html = ui::field_bar(&shown, self.caret, self.select_all);
-            let mut c = self.render_layer(&html, "kb://keyboard/", self.width, TOP_H);
-            c.key = key;
-            self.field = Some(c);
+            self.post_layer(FIELD, key, html, "kb://keyboard/", self.width, TOP_H);
         }
         self.field.as_mut().expect("field layer")
     }
@@ -251,9 +249,8 @@ impl Browser {
         let key: String = self.suggestions.iter().map(|(u, _, _)| u.as_str()).collect::<Vec<_>>().join("\n");
         if self.suggest.as_ref().map_or(true, |c| c.key != key) {
             let html = ui::field_list(&self.suggestions);
-            let mut c = self.render_layer(&html, "kb://keyboard/", self.width, self.kb_y() - TOP_H);
-            c.key = key;
-            self.suggest = Some(c);
+            let height = self.kb_y() - TOP_H;
+            self.post_layer(SUGGEST, key, html, "kb://keyboard/", self.width, height);
         }
         self.suggest.as_mut().expect("suggestion layer")
     }
@@ -270,17 +267,13 @@ impl Browser {
     }
 
     pub(super) fn ensure_key(&mut self, layer: Layer) -> &mut Cached {
+        // The key layers are drawn with the label the Go key shows (Go, Done or Find).
         let label = self.go_label();
-        if self.keys_label != label {
-            // The key layers were drawn with another label: draw them again.
-            self.keys = [None, None, None, None];
-            self.keys_label = label;
-        }
         let idx = layer as usize;
-        if self.keys[idx].is_none() {
-            let html = ui::keyboard_for(layer, self.go_label(), self.height - self.kb_y());
-            let c = self.render_layer(&html, "kb://keyboard/", self.width, self.height - self.kb_y());
-            self.keys[idx] = Some(c);
+        if self.keys[idx].as_ref().map_or(true, |c| c.key != label) {
+            let html = ui::keyboard_for(layer, label, self.height - self.kb_y());
+            let height = self.height - self.kb_y();
+            self.post_layer(KEY0 + idx, label.to_string(), html, "kb://keyboard/", self.width, height);
         }
         self.keys[idx].as_mut().expect("key layer")
     }

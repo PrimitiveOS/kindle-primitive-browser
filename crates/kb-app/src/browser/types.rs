@@ -1,8 +1,7 @@
 //! Types shared by the browser: drawing updates, the cached layers, page and tab state, sheets.
 
-use kb_engine::Page;
+use super::host::{ChromeSlots, Host};
 
-pub type Pump = Box<dyn FnMut(f32, &str) -> bool>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Wave {
@@ -50,18 +49,66 @@ impl Update {
 #[derive(Debug)]
 pub struct Cancelled;
 
+/// A chrome layer on screen: its picture (`gray`, empty until the first render), the key it was drawn for, and the
+/// chrome worker that holds its document (`slot`). The picture stays until the new one arrives.
 pub(super) struct Cached {
     pub(super) key: String,
-    pub(super) page: Page,
     pub(super) gray: Vec<u8>,
+    pub(super) slot: usize,
+    pub(super) host: Host<ChromeSlots>,
 }
 
+impl Cached {
+    /// Run `f` on this layer's document on the chrome worker. Waits behind a render of this layer that is running.
+    fn on_page<R: Send + 'static>(&self, f: impl FnOnce(&mut kb_engine::Page) -> R + Send + 'static) -> Option<R> {
+        let slot = self.slot;
+        self.host
+            .ask(move |state: &mut ChromeSlots| state.pages.get_mut(slot).and_then(|p| p.as_mut()).map(f))
+            .flatten()
+    }
+
+    pub(super) fn link_at(&self, x: f32, y: f32) -> Option<String> {
+        self.on_page(move |p| p.link_at(x, y)).flatten()
+    }
+
+    pub(super) fn link_box(&self, x: f32, y: f32) -> Option<(f32, f32, f32, f32)> {
+        self.on_page(move |p| p.link_box(x, y)).flatten()
+    }
+
+    pub(super) fn element_box(&self, selector: &str) -> Option<(f32, f32, f32, f32)> {
+        let selector = selector.to_string();
+        self.on_page(move |p| p.element_box(&selector)).flatten()
+    }
+}
+
+/// The chrome layer slots (indexes on the chrome worker). The keyboard keys are `KEY0 + layer`.
+pub(super) const TOP: usize = 0;
+pub(super) const BOTTOM: usize = 1;
+pub(super) const SHEET: usize = 2;
+pub(super) const SHEET_HEADER: usize = 3;
+pub(super) const QUICK: usize = 4;
+pub(super) const FIELD: usize = 5;
+pub(super) const SUGGEST: usize = 6;
+pub(super) const KEY0: usize = 7;
+pub(super) const TOAST: usize = 11;
+
+/// The page kept for Back. Its document is on the page worker (`Slots::previous`).
 pub(super) struct PreviousPage {
     pub(super) url: String,
-    pub(super) page: Page,
     pub(super) source: String,
     pub(super) reader_source: Option<String>,
     pub(super) is_web: bool,
+}
+
+/// A paint or a prefetch sent to the page worker and not yet applied. It is applied only if the page
+/// has not changed since (`gen`), and its screen is cached under `key` (scroll position, chrome offset).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Flight {
+    pub(super) ticket: u64,
+    pub(super) gen: u64,
+    pub(super) key: (u64, u32),
+    /// The chrome offset the picture is painted with (a paint only; a prefetch keeps the key's offset).
+    pub(super) offset: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

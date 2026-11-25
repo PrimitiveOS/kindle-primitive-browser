@@ -6,7 +6,8 @@ use super::*;
 impl Browser {
     /// Elements matching `selector` on the page on screen (debugging and tests).
     pub fn count_in_page(&self, selector: &str) -> usize {
-        self.page.as_ref().map_or(0, |p| p.count(selector))
+        let sel = selector.to_string();
+        self.page_on(move |p| p.count(&sel)).unwrap_or(0)
     }
 
     /// Centre of the first displayed element matching `selector` on the current screen,
@@ -16,31 +17,32 @@ impl Browser {
         let centre = |(x, y, w, h): (f32, f32, f32, f32)| (x + w / 2.0, y + h / 2.0);
         if self.quick && !self.keyboard {
             // The panel covers the top of the screen, so only its own elements count.
-            let (x, y) = centre(self.ensure_quick().page.element_box(selector)?);
+            let (x, y) = centre(self.ensure_quick().element_box(selector)?);
             return Some((x, y));
         }
         if self.keyboard {
-            if let Some(b) = self.ensure_field().page.element_box(selector) {
+            if let Some(b) = self.ensure_field().element_box(selector) {
                 return Some(centre(b));
             }
             // A suggestion counts as on screen only where the list shows it (above the keys).
-            if let Some(b) = self.ensure_suggestions().page.element_box(selector) {
+            if let Some(b) = self.ensure_suggestions().element_box(selector) {
                 let (x, y) = centre(b);
                 let y = y + TOP_H as f32;
                 return (y >= TOP_H as f32 && y < self.kb_y() as f32).then_some((x, y));
             }
-            let (x, y) = centre(self.ensure_key(self.layer).page.element_box(selector)?);
+            let (x, y) = centre(self.ensure_key(self.layer).element_box(selector)?);
             return Some((x, y + self.kb_y() as f32));
         }
         if let Some(sheet) = self.sheet {
-            if let Some(b) = self.ensure_sheet_header(sheet).page.element_box(selector) {
+            if let Some(b) = self.ensure_sheet_header(sheet).element_box(selector) {
                 let (x, y) = centre(b);
                 return Some((x, y + (self.height - MENU_H) as f32));
             }
-            let (x, y) = centre(self.ensure_sheet(sheet).page.element_box(selector)?);
+            let (x, y) = centre(self.ensure_sheet(sheet).element_box(selector)?);
             return Some((x, y + (self.height - MENU_H + SHEET_TITLE_H) as f32));
         }
-        let (x, y) = centre(self.page.as_ref()?.element_box(selector)?);
+        let sel = selector.to_string();
+        let (x, y) = centre(self.page_on(move |p| p.element_box(&sel)).flatten()?);
         Some((x, y + self.page_offset() as f32))
     }
 
@@ -50,7 +52,8 @@ impl Browser {
         if self.keyboard || self.sheet.is_some() {
             return;
         }
-        let Some((_, y, _, h)) = self.page.as_ref().and_then(|p| p.element_box(selector)) else {
+        let sel = selector.to_string();
+        let Some((_, y, _, h)) = self.page_on(move |p| p.element_box(&sel)).flatten() else {
             return;
         };
         let off = self.page_offset() as f32;
@@ -59,14 +62,14 @@ impl Browser {
         if centre_on_screen >= off && centre_on_screen <= (self.height - BOT_H) as f32 {
             return;
         }
-        if let Some(page) = self.page.as_mut() {
-            let doc_y = y + page.scroll_y() as f32;
+        self.page_on(move |p| {
+            let doc_y = y + p.scroll_y() as f32;
             let target = (doc_y + h / 2.0 - visible / 2.0).max(0.0) as f64;
-            let delta = target - page.scroll_y();
-            page.scroll_by(delta);
-            self.mark_page_dirty();
-            self.touch(0, self.height, Wave::Text);
-        }
+            let delta = target - p.scroll_y();
+            p.scroll_by(delta);
+        });
+        self.mark_page_dirty();
+        self.touch(0, self.height, Wave::Text);
     }
 
     /// Tap the centre of the first element matching `selector`, scrolling it into view first.
@@ -103,12 +106,13 @@ impl Browser {
     /// Debug: what the page resolves at a screen point (link href, if any).
     pub fn link_at_screen(&self, x: f32, y: f32) -> Option<String> {
         let off = self.page_offset() as f32;
-        self.page.as_ref()?.link_at(x, y - off)
+        self.page_on(move |p| p.link_at(x, y - off)).flatten()
     }
 
     /// Text of the first element matching `selector` on the page on screen (tests and debugging).
     pub fn text_in_page(&self, selector: &str) -> Option<String> {
-        self.page.as_ref()?.text_of(selector)
+        let sel = selector.to_string();
+        self.page_on(move |p| p.text_of(&sel)).flatten()
     }
 
     /// Displayed elements matching `selector` on the page on screen (debugging and tests).
@@ -133,6 +137,7 @@ impl Browser {
     }
 
     pub fn visible_in_page(&self, selector: &str) -> usize {
-        self.page.as_ref().map_or(0, |p| p.visible_count(selector))
+        let sel = selector.to_string();
+        self.page_on(move |p| p.visible_count(&sel)).unwrap_or(0)
     }
 }

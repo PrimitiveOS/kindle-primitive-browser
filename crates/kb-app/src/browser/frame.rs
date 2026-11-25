@@ -1,12 +1,20 @@
 //! Composing the screen: bars, sheets, notices and the keyboard, the cached layers, the notice
 //! timer, and PNG output.
 
+use super::host::ChromeSlots;
+use super::types::{BOTTOM, FIELD, KEY0, QUICK, SHEET, SHEET_HEADER, SUGGEST, TOAST, TOP};
 use super::*;
 use crate::ui;
 
 pub(super) fn blit(dst: &mut [u8], width: u32, y: u32, src: &[u8], rows: u32) {
     let w = width as usize;
     let start = y as usize * w;
+    if src.is_empty() {
+        // A chrome layer not drawn yet shows as a blank (white) area.
+        let n = (rows as usize * w).min(dst.len().saturating_sub(start));
+        dst[start..start + n].fill(255);
+        return;
+    }
     let n = (rows as usize * w)
         .min(src.len())
         .min(dst.len().saturating_sub(start));
@@ -40,23 +48,37 @@ pub fn encode_png(width: u32, height: u32, gray: &[u8]) -> Result<Vec<u8>, Strin
     Ok(out)
 }
 
+/// Add the rows `[y0, y1)` at `wave` to a pending change: the union of rows, the strongest waveform.
+fn merge_change(
+    change: Option<((u32, u32), Wave)>,
+    y0: u32,
+    y1: u32,
+    wave: Wave,
+) -> Option<((u32, u32), Wave)> {
+    Some(match change {
+        None => ((y0, y1), wave),
+        Some(((a, b), w)) => ((a.min(y0), b.max(y1)), w.max(wave)),
+    })
+}
+
 impl Browser {
     /// Top of the keyboard's keys on this screen.
     pub(super) fn kb_y(&self) -> u32 {
         kb_top(self.height)
     }
 
-    /// Render the screens next to the current one while the reader is idle, so a page turn either way
-    /// copies one. A turn forward hides the bars and a turn back keeps them, so each is kept as it looks
-    /// then. One screen per call: a button pressed during it waits for one render at most.
+    /// Render the screen next to the current one while the reader is idle, so a page turn either way
+    /// copies it instead of painting. The paint runs on the page worker; its result is cached in `collect`.
+    /// One screen per call.
     pub(super) fn prefetch_next_screen(&mut self) {
-        if self.page_dirty || self.sheet.is_some() || self.keyboard || self.quick {
+        if self.page_dirty || self.paint.is_some() || self.prefetch.is_some() {
             return;
         }
-        let (current, max) = match self.page.as_ref() {
-            Some(p) => (p.scroll_y(), p.max_scroll()),
-            None => return,
-        };
+        if self.sheet.is_some() || self.keyboard || self.quick || !self.has_page() {
+            return;
+        }
+        let mirror = self.host.mirror();
+        let (current, max) = (mirror.scroll_y, mirror.max_scroll);
         // The same distances a page turn will use, so the turn finds its screen here.
         let next = (current + self.turn_distance(1.0)).min(max);
         let prev = (current + self.turn_distance(-1.0)).max(0.0);
@@ -73,19 +95,33 @@ impl Browser {
             if self.page_cache.iter().any(|(k, _)| *k == key) {
                 continue;
             }
-            let Some(page) = self.page.as_mut() else { return };
-            page.scroll_to(target);
-            let gray = page.render_gray_at(offset);
-            page.scroll_to(current);
-            self.cache_screen(key, gray);
+            let gen = self.page_gen;
+            let ticket = self.host.post(move |slots: &mut Slots| {
+                let Some(page) = slots.page.as_mut() else { return Vec::new() };
+                page.scroll_to(target);
+                let gray = page.render_gray_at(offset);
+                page.scroll_to(current);
+                gray
+            });
+            self.prefetch = ticket.map(|ticket| Flight { ticket, gen, key, offset });
             return;
         }
     }
 
-    /// Called regularly by the driver (on idle). Brings in held-back images and
-    /// clears a notice when its time is up.
+    /// Called regularly by the driver (on idle). Brings in held-back images and clears a notice when its
+    /// time is up. A page change it causes is shown when its paint finishes (`page_ready`).
     pub fn tick(&mut self) -> Option<Update> {
-        self.prefetch_next_screen();
+        self.collect();
+        // The progress strip follows a load in progress (it changes as the download and the images arrive).
+        let progress = self.load_progress();
+        if progress != self.progress && self.pending.is_some() {
+            self.progress = progress;
+            self.touch(0, TOP_H, Wave::Fast);
+            return self.try_frame();
+        }
+        if self.paint.is_none() && self.prefetch.is_none() {
+            self.prefetch_next_screen();
+        }
         let done = self
             .net
             .stats()
@@ -101,27 +137,26 @@ impl Browser {
             let wave = if self.images_loading() { Wave::Text } else { Wave::Flash };
             self.touch(0, self.height, wave);
             self.mark_page_dirty();
-            return Some(self.frame());
+            return self.try_frame();
         }
         if let Some((_, until)) = &self.toast {
             if Instant::now() >= *until {
                 self.toast = None;
                 let (y0, y1) = toast_rows(self.height);
-                self.touch(y0, y1, Wave::Fast);
-                return Some(self.frame());
+                self.touch_chrome(y0, y1, Wave::Fast);
+                return self.try_frame();
             }
         }
         None
     }
 
-    /// Show a short notice above the bottom toolbar for about two seconds.
     pub fn notify(&mut self, message: &str) {
         self.toast = Some((
             message.to_string(),
             Instant::now() + Duration::from_millis(2200),
         ));
         let (y0, y1) = toast_rows(self.height);
-        self.touch(y0, y1, Wave::Fast);
+        self.touch_chrome(y0, y1, Wave::Fast);
     }
 
     /// Whether a notice is on screen (drivers keep ticking until it clears).
@@ -130,10 +165,11 @@ impl Browser {
     }
 
     pub(super) fn touch(&mut self, y0: u32, y1: u32, wave: Wave) {
-        self.change = Some(match self.change {
-            None => ((y0, y1), wave),
-            Some(((a, b), w)) => ((a.min(y0), b.max(y1)), w.max(wave)),
-        });
+        self.pending_page = merge_change(self.pending_page, y0, y1, wave);
+    }
+
+    pub(super) fn touch_chrome(&mut self, y0: u32, y1: u32, wave: Wave) {
+        self.change = merge_change(self.change, y0, y1, wave);
     }
 
     /// The current screen as an update. Only the rows that changed are marked
@@ -159,10 +195,159 @@ impl Browser {
     }
 
     pub fn frame(&mut self) -> Update {
+        loop {
+            self.collect();
+            if self.pending.is_some() {
+                // A load in progress: the page it shows is the one that arrives.
+                self.wait_pending();
+                continue;
+            }
+            if self.paint.is_none() {
+                self.start_paint_if_needed();
+            }
+            if self.paint.is_some() {
+                self.wait_paint();
+                continue;
+            }
+            if !self.chrome_flights.is_empty() {
+                self.wait_chrome();
+                continue;
+            }
+            // Drawing the screen may start chrome renders (a sheet or a key layer that changed): wait for them too.
+            let update = self.compose_update(true);
+            if self.chrome_flights.is_empty() && self.paint.is_none() {
+                return update;
+            }
+        }
+    }
+
+    pub fn try_frame(&mut self) -> Option<Update> {
+        self.collect();
+        if self.paint.is_none() {
+            self.start_paint_if_needed();
+        }
+        if self.paint.is_none() {
+            return Some(self.compose_update(true));
+        }
+        // A page is being painted: the bars and sheets are shown now, over the picture on screen. The page change
+        // stays pending until its paint is applied (`page_ready`).
+        let pressed = self.pressed_rows.is_some();
+        if self.change.is_none() && !pressed {
+            return None;
+        }
+        Some(self.compose_update(false))
+    }
+
+    pub fn page_ready(&mut self) -> Option<Update> {
+        self.collect();
+        if self.paint.is_none() {
+            self.start_paint_if_needed();
+        }
+        // Nothing is waiting: a finished prefetch, or a paint that a tap already applied. No screen to show.
+        if self.paint.is_none()
+            && self.change.is_none()
+            && self.pending_page.is_none()
+            && self.pressed_rows.is_none()
+        {
+            return None;
+        }
+        self.try_frame()
+    }
+
+    pub(super) fn collect(&mut self) {
+        self.collect_chrome();
+        self.poll_pending();
+        if let Some(flight) = self.paint {
+            if let Some(result) = self.host.take::<Vec<u8>>(flight.ticket) {
+                self.paint = None;
+                self.apply_paint(flight, result);
+            }
+        }
+        if let Some(flight) = self.prefetch {
+            if let Some(result) = self.host.take::<Vec<u8>>(flight.ticket) {
+                self.prefetch = None;
+                if let Some(gray) = result {
+                    if flight.gen == self.page_gen && !gray.is_empty() {
+                        self.cache_screen(flight.key, gray);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Block until the paint in flight is applied.
+    fn wait_paint(&mut self) {
+        let Some(flight) = self.paint.take() else { return };
+        let result = self.host.wait::<Vec<u8>>(flight.ticket);
+        self.apply_paint(flight, result);
+    }
+
+    /// Show a finished paint. `None` means the paint panicked or the worker is gone: keep the picture on screen.
+    fn apply_paint(&mut self, flight: Flight, result: Option<Vec<u8>>) {
+        if flight.gen != self.page_gen {
+            // The page changed while it was painted; the next frame paints again.
+            return;
+        }
+        self.page_dirty = false;
+        let Some(gray) = result else { return };
+        self.cache_screen(flight.key, gray.clone());
+        self.page_gray = gray;
+        self.page_gray_offset = flight.offset;
+    }
+
+    /// Get the picture of the page for the current scroll position and chrome offset: from the cache when it is
+    /// there, otherwise by a paint on the worker (which `collect` applies). Does nothing when the page is current.
+    pub(super) fn start_paint_if_needed(&mut self) {
+        // A load in progress: the page on screen stays as it is until the new one is shown.
+        if !self.page_dirty || self.paint.is_some() || self.pending.is_some() {
+            return;
+        }
+        let want = self.page_offset();
+        let key = (self.scroll_pos().round() as u64, want);
+        if let Some((_, gray)) = self.page_cache.iter().find(|(k, _)| *k == key) {
+            self.page_gray = gray.clone();
+            self.page_gray_offset = want;
+            self.page_dirty = false;
+            return;
+        }
+        if !self.has_page() {
+            self.page_gray = vec![255u8; (self.width * self.height) as usize];
+            self.page_gray_offset = want;
+            self.page_dirty = false;
+            return;
+        }
+        let delay = self.host.paint_delay();
+        let gen = self.page_gen;
+        let ticket = self.host.post(move |slots: &mut Slots| {
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            slots
+                .page
+                .as_mut()
+                .map(|p| p.render_gray_at(want))
+                .unwrap_or_default()
+        });
+        match ticket {
+            Some(ticket) => self.paint = Some(Flight { ticket, gen, key, offset: want }),
+            // The worker is gone: keep the picture on screen rather than wait for a paint that cannot come.
+            None => self.page_dirty = false,
+        }
+    }
+
+    /// The whole screen as it is now, and clears the pending change. `include_page` also shows the pending page
+    /// change; without it only the bars and other chrome changes are shown.
+    fn compose_update(&mut self, include_page: bool) -> Update {
+        let page = if include_page { self.pending_page.take() } else { None };
+        let merged = match (self.change.take(), page) {
+            (None, None) => None,
+            (Some(c), None) | (None, Some(c)) => Some(c),
+            (Some((a, wa)), Some((b, wb))) => Some(((a.0.min(b.0), a.1.max(b.1)), wa.max(wb))),
+        };
         // The highlight drawn by `press` is taken back here. When nothing else changed, only the key's own
         // columns go back to the panel; otherwise the highlight's rows join the change, across the full width.
         let pressed = self.pressed_rows.take();
-        let (rows, wave, cols) = match (self.change.take(), pressed) {
+        let (rows, wave, cols) = match (merged, pressed) {
             (None, Some((cols, rows))) => (rows, Wave::Fast, cols),
             (None, None) => ((0, self.height), Wave::Text, (0, self.width)),
             (Some((rows, wave)), None) => (rows, wave, (0, self.width)),
@@ -210,21 +395,26 @@ impl Browser {
         self.settings.solid_text
     }
 
-    /// Push the current screen to the draw sink now (used while a load is still running).
     pub(super) fn emit_frame(&mut self) {
         if self.draw.is_none() {
             return;
         }
-        let update = self.frame();
+        self.collect();
+        let update = self.compose_update(true);
         if let Some(draw) = self.draw.as_mut() {
             draw(update);
         }
     }
 
-    /// The page's content changed: the rendered screens are out of date.
     pub(super) fn mark_page_dirty(&mut self) {
-        self.page_dirty = true;
         self.page_cache.clear();
+        self.page_changed();
+    }
+
+    /// The page changed: the picture on screen is out of date, and a paint started now belongs to an older state.
+    pub(super) fn page_changed(&mut self) {
+        self.page_dirty = true;
+        self.page_gen += 1;
     }
 
     /// Keep a rendered screen; the cache holds the last few (a page turn needs the next one).
@@ -238,24 +428,13 @@ impl Browser {
     }
 
     pub(super) fn compose_browse(&mut self) -> Vec<u8> {
-        let want = self.page_offset();
-        if self.page_dirty || self.page_gray.is_empty() || self.page_gray_offset != want {
-            let key = (self.page.as_ref().map_or(0, |p| p.scroll_y().round() as u64), want);
-            let cached = self.page_cache.iter().find(|(k, _)| *k == key).map(|(_, g)| g.clone());
-            self.page_gray = match (cached, self.page.as_mut()) {
-                (Some(gray), _) => gray,
-                (None, Some(p)) => {
-                    let gray = p.render_gray_at(want);
-                    self.cache_screen(key, gray.clone());
-                    gray
-                }
-                (None, None) => vec![255u8; (self.width * self.height) as usize],
-            };
-            self.page_gray_offset = want;
-            self.page_dirty = false;
-        }
-        let mut out = self.page_gray.clone();
         let (w, h) = (self.width, self.height);
+        // The picture of the page on screen (never painted here: `start_paint_if_needed` does that).
+        let mut out = if self.page_gray.len() == (w * h) as usize {
+            self.page_gray.clone()
+        } else {
+            vec![255u8; (w * h) as usize]
+        };
         if let Some(sheet) = self.sheet {
             let layer = self.ensure_sheet(sheet).gray.clone();
             blit(
@@ -283,6 +462,10 @@ impl Browser {
             let (y0, _) = toast_rows(self.height);
             blit(&mut out, w, y0, &layer, 88);
         }
+        if let Some(fraction) = self.progress {
+            let y = if self.chrome { TOP_H - PROGRESS_H } else { 0 };
+            progress_strip(&mut out, w, y, fraction);
+        }
         if self.images_loading() {
             let s = self.net.stats();
             let done = s.deferred_done.load(std::sync::atomic::Ordering::Relaxed) as f32;
@@ -294,27 +477,11 @@ impl Browser {
     }
 
     pub(super) fn toast_layer(&mut self, message: &str) -> Vec<u8> {
-        if self
-            .toast_cache
-            .as_ref()
-            .map_or(true, |(m, _)| m != message)
-        {
+        if self.toast_cache.as_ref().map_or(true, |c| c.key != message) {
             let html = ui::toast(message);
-            let mut page = Page::new(
-                &html,
-                "kb://chrome/",
-                self.width,
-                88,
-                self.net.clone(),
-                &mut || true,
-            );
-            let gray = page.render_gray();
-            self.toast_cache = Some((message.to_string(), gray));
+            self.post_layer(TOAST, message.to_string(), html, "kb://chrome/", self.width, 88);
         }
-        self.toast_cache
-            .as_ref()
-            .map(|(_, g)| g.clone())
-            .unwrap_or_default()
+        self.toast_cache.as_ref().map(|c| c.gray.clone()).unwrap_or_default()
     }
 
     pub(super) fn compose_keyboard(&mut self) -> Vec<u8> {
@@ -330,13 +497,99 @@ impl Browser {
         out
     }
 
-    pub(super) fn render_layer(&self, html: &str, base: &str, w: u32, h: u32) -> Cached {
-        let mut page = Page::new(html, base, w, h, self.net.clone(), &mut || true);
-        let gray = page.render_gray();
-        Cached {
-            key: String::new(),
-            page,
-            gray,
+    /// Draw a chrome layer on the chrome worker. The layer keeps its last picture until the new one is applied
+    /// (`collect_chrome`), so the screen never shows a blank bar or sheet in between.
+    pub(super) fn post_layer(&mut self, slot: usize, key: String, html: String, base: &str, w: u32, h: u32) {
+        let net = self.net.clone();
+        let base = base.to_string();
+        let delay = self.chrome_host.paint_delay();
+        if let Some(ticket) = self.chrome_host.post(move |state: &mut ChromeSlots| {
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            let mut page = Page::new(&html, &base, w, h, net.clone(), &mut || true);
+            let gray = page.render_gray();
+            state.pages[slot] = Some(page);
+            gray
+        }) {
+            self.chrome_flights.push_back((ticket, slot));
+        }
+        let host = self.chrome_host.clone();
+        let field = self.layer_field(slot);
+        let gray = field.take().map(|c| c.gray).unwrap_or_default();
+        *field = Some(Cached { key, gray, slot, host });
+    }
+
+    /// The field holding a chrome layer (the keyboard keys by their index).
+    fn layer_field(&mut self, slot: usize) -> &mut Option<Cached> {
+        match slot {
+            TOP => &mut self.top,
+            BOTTOM => &mut self.bottom,
+            SHEET => &mut self.sheet_layer,
+            SHEET_HEADER => &mut self.sheet_header,
+            QUICK => &mut self.quick_layer,
+            FIELD => &mut self.field,
+            SUGGEST => &mut self.suggest,
+            TOAST => &mut self.toast_cache,
+            key => &mut self.keys[key - KEY0],
+        }
+    }
+
+    /// The rows of the screen a chrome layer is drawn on.
+    fn slot_rows(&self, slot: usize) -> (u32, u32) {
+        let h = self.height;
+        match slot {
+            TOP | FIELD => (0, TOP_H),
+            BOTTOM => (h - BOT_H, h),
+            SHEET => (h - MENU_H + SHEET_TITLE_H, h),
+            SHEET_HEADER => (h - MENU_H, h - MENU_H + SHEET_TITLE_H),
+            QUICK => (0, QUICK_H),
+            SUGGEST => (TOP_H, self.kb_y()),
+            TOAST => toast_rows(h),
+            _ => (self.kb_y(), h),
+        }
+    }
+
+    /// Show a finished chrome render (or scroll): its picture, and its rows as a change of the bars.
+    fn apply_chrome(&mut self, slot: usize, result: Option<Vec<u8>>) {
+        if let Some(gray) = result {
+            if let Some(cached) = self.layer_field(slot).as_mut() {
+                cached.gray = gray;
+            }
+        }
+        let (y0, y1) = self.slot_rows(slot);
+        self.touch_chrome(y0, y1, Wave::Text);
+    }
+
+    /// Apply the chrome renders the worker has finished, in the order they were sent.
+    pub(super) fn collect_chrome(&mut self) {
+        while let Some(&(ticket, slot)) = self.chrome_flights.front() {
+            let Some(result) = self.chrome_host.take::<Vec<u8>>(ticket) else { break };
+            self.chrome_flights.pop_front();
+            self.apply_chrome(slot, result);
+        }
+    }
+
+    /// Block until the oldest chrome render is applied.
+    pub(super) fn wait_chrome(&mut self) {
+        if let Some((ticket, slot)) = self.chrome_flights.pop_front() {
+            let result = self.chrome_host.wait::<Vec<u8>>(ticket);
+            self.apply_chrome(slot, result);
+        }
+    }
+
+    /// Scroll a chrome layer (a sheet or the suggestion list) and draw it again, on the chrome worker.
+    pub(super) fn layer_scroll(&mut self, slot: usize, dy: f64) {
+        if let Some(ticket) = self.chrome_host.post(move |state: &mut ChromeSlots| {
+            match state.pages.get_mut(slot).and_then(|p| p.as_mut()) {
+                Some(page) => {
+                    page.scroll_by(dy);
+                    page.render_gray_at(0)
+                }
+                None => Vec::new(),
+            }
+        }) {
+            self.chrome_flights.push_back((ticket, slot));
         }
     }
 
@@ -344,9 +597,7 @@ impl Browser {
         let key = format!("{}|{}", self.url, self.can_go_back());
         if self.top.as_ref().map_or(true, |c| c.key != key) {
             let html = ui::top(&self.url);
-            let mut c = self.render_layer(&html, "kb://chrome/", self.width, TOP_H);
-            c.key = key;
-            self.top = Some(c);
+            self.post_layer(TOP, key, html, "kb://chrome/", self.width, TOP_H);
         }
         self.top.as_mut().expect("top layer")
     }
@@ -368,9 +619,7 @@ impl Browser {
                 marked,
                 self.tabs.len().max(1),
             );
-            let mut c = self.render_layer(&html, "kb://chrome/", self.width, BOT_H);
-            c.key = key;
-            self.bottom = Some(c);
+            self.post_layer(BOTTOM, key, html, "kb://chrome/", self.width, BOT_H);
         }
         self.bottom.as_mut().expect("bottom layer")
     }
@@ -384,16 +633,14 @@ impl Browser {
         let key = format!("{:?}{:?}", self.device_status, on);
         if self.quick_layer.as_ref().map_or(true, |c| c.key != key) {
             let html = ui::quick_panel(&self.device_status, on);
-            let mut c = self.render_layer(&html, "kb://chrome/", self.width, QUICK_H);
-            c.key = key;
-            self.quick_layer = Some(c);
+            self.post_layer(QUICK, key, html, "kb://chrome/", self.width, QUICK_H);
         }
         self.quick_layer.as_mut().expect("quick layer")
     }
 
     pub(super) fn show_sheet(&mut self, sheet: Sheet) {
         self.sheet = Some(sheet);
-        self.touch(self.height - MENU_H, self.height, Wave::Text);
+        self.touch_chrome(self.height - MENU_H, self.height, Wave::Text);
     }
 
     /// The menu or tab sheet, rendered once per state.
@@ -454,10 +701,7 @@ impl Browser {
                     self.settings.book_lines,
                 ),
             };
-            let mut c =
-                self.render_layer(&html, "kb://chrome/", self.width, MENU_H - SHEET_TITLE_H);
-            c.key = key;
-            self.sheet_layer = Some(c);
+            self.post_layer(SHEET, key, html, "kb://chrome/", self.width, MENU_H - SHEET_TITLE_H);
         }
         self.sheet_layer.as_mut().expect("sheet layer")
     }
@@ -478,9 +722,7 @@ impl Browser {
             // the page above them.
             let controls = if sheet == Sheet::Menu { ui::find_button() + &ui::exit_button() } else { String::new() };
             let html = ui::sheet_header(&title, &controls);
-            let mut c = self.render_layer(&html, "kb://chrome/", self.width, SHEET_TITLE_H);
-            c.key = title;
-            self.sheet_header = Some(c);
+            self.post_layer(SHEET_HEADER, title, html, "kb://chrome/", self.width, SHEET_TITLE_H);
         }
         self.sheet_header.as_mut().expect("sheet header")
     }
